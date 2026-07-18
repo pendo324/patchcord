@@ -38,5 +38,7 @@ for arch in "${!builds[@]}"; do
   fi
 done
 
+chmod +x dist/*-linux-* 2>/dev/null || true
+
 echo "🎉 Done! Binaries are in ./dist/"
 ls -lh dist/
