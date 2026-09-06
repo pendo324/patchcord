@@ -1,4 +1,5 @@
 pub mod cmd;
+pub mod pw_backend;
 pub mod error;
 pub mod models;
 pub mod routing;
