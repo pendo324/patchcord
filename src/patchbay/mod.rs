@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use error::{BackendError, Result};
-pub use models::{ShareableNode, VirtualSinkInfo};
+pub use models::{RouteFilter, ShareableNode, VirtualSinkInfo};
 pub use state_native::PatchbayStateNative;
 
 use crate::logger;
@@ -163,10 +163,10 @@ impl AudioSharePatchbay {
 		}
 	}
 
-	pub fn route_nodes(&mut self, node_ids: Vec<u32>) -> Result<VirtualSinkInfo> {
+	pub fn route_nodes(&mut self, node_ids: Vec<u32>, filter: RouteFilter) -> Result<VirtualSinkInfo> {
 		match &mut self.state {
 			BackendState::Legacy(state) => state.route_nodes(node_ids),
-			BackendState::Native(state) => state.route_nodes(node_ids),
+			BackendState::Native(state) => state.route_nodes(node_ids, filter),
 		}
 	}
 

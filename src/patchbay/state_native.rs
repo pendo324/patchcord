@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
-use super::models::{NodeRecord, ShareableNode, VirtualSinkInfo};
+use super::models::{NodeRecord, RouteFilter, ShareableNode, VirtualSinkInfo};
 use super::pw_backend::{BackendEvent, GraphSnapshot, PipewireBackend};
 use super::routing::map_ports;
 use super::PatchbayConfig;
@@ -190,46 +190,55 @@ impl PatchbayStateNative {
     /// may not all be visible immediately, in which case we log and let
     /// the graph-change callback retry. 
     fn link_monitor_to_mic(&mut self) -> Result<()> {
-        let Some(sink_id) = self.find_sink_id()? else {
-            return Ok(());
-        };
         let Some(mic_id) = self.find_mic_id()? else {
             return Ok(());
         };
 
-        let snapshot = self.backend.snapshot()?;
-        let monitor_name = format!("{}.monitor", self.session.sink_name);
-        let monitor = snapshot
-            .nodes
-            .values()
-            .find(|n| n.prop_str("node.name") == Some(monitor_name.as_str()))
-            .or_else(|| snapshot.nodes.get(&sink_id).filter(|n| n.output_ports().next().is_some()));
+        // Wait (up to ~3s) for the sink's monitor ports and the mic's
+        // input ports to be visible, then create the FL/FR links. Without
+        // them the virtual mic captures silence. Port globals can arrive
+        // asynchronously after node creation, so poll the live graph
+        // rather than giving up on the first snapshot.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = self.backend.snapshot()?;
+            let monitor_name = format!("{}.monitor", self.session.sink_name);
+            let monitor = snapshot
+                .nodes
+                .values()
+                .find(|n| n.prop_str("node.name") == Some(monitor_name.as_str()));
+            let mic = snapshot.nodes.get(&mic_id);
 
-        let mic = snapshot.nodes.get(&mic_id);
-        let (Some(m), Some(mic)) = (monitor, mic) else {
-            logger::warn("[patchbay] monitor or mic node not visible yet; will retry on next graph change");
-            return Ok(());
-        };
+            if let (Some(m), Some(mic)) = (monitor, mic) {
+                let outputs = m.output_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
+                let inputs = mic.input_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
 
-        let outputs = m.output_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
-        let inputs = mic.input_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
+                if !outputs.is_empty() && !inputs.is_empty() {
+                    for (output, input) in map_ports(&outputs, &inputs) {
+                        let handle = self.backend.create_link(m.id, output.id, mic_id, input.id)?;
+                        // Monitor->mic links are part of the virtual mic's
+                        // identity, not "routes"; tracked for cleanup here.
+                        self.session.route_link_handles.push(handle);
+                    }
+                    logger::info(&format!(
+                        "[patchbay] linked sink monitor -> virtual mic ({outputs} outputs -> {inputs} inputs)",
+                        outputs = outputs.len(),
+                        inputs = inputs.len()
+                    ));
+                    return Ok(());
+                }
+            }
 
-        if outputs.is_empty() || inputs.is_empty() {
-            logger::warn("[patchbay] monitor/mic ports not ready yet; will retry on next graph change");
-            return Ok(());
+            if Instant::now() >= deadline {
+                return Err(BackendError::Message(
+                    "timed out linking sink monitor to virtual mic".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
-
-        for (output, input) in map_ports(&outputs, &inputs) {
-            let handle = self.backend.create_link(m.id, output.id, mic_id, input.id)?;
-            // Monitor->mic links are part of the virtual mic's identity,
-            // not "routes", so remember them for cleanup separately.
-            self.session.route_link_handles.push(handle);
-        }
-
-        Ok(())
     }
 
-    pub fn route_nodes(&mut self, node_ids: Vec<u32>) -> Result<VirtualSinkInfo> {
+    pub fn route_nodes(&mut self, node_ids: Vec<u32>, filter: RouteFilter) -> Result<VirtualSinkInfo> {
         if node_ids.is_empty() {
             self.clear_routes()?;
             return self.ensure_virtual_sink();
@@ -251,6 +260,11 @@ impl PatchbayStateNative {
             return Err(BackendError::Message("virtual sink has no usable stereo input ports".to_string()));
         }
 
+        let default_sink_id = filter
+            .only_default_speakers
+            .then(|| resolve_default_sink_id(&snapshot))
+            .flatten();
+
         let mut new_handles = Vec::<u32>::new();
         let mut failed = Vec::<u32>::new();
 
@@ -267,6 +281,14 @@ impl PatchbayStateNative {
 
             if self.is_our_virtual_audio_object(node) {
                 logger::warn(&format!("[patchbay] refusing to route helper-owned virtual node {node_id}"));
+                continue;
+            }
+
+            if !should_link(&snapshot, node, &filter, default_sink_id) {
+                logger::debug(&format!(
+                    "[patchbay] node {node_id} filtered out by route filter (only_speakers={}, only_default={}, ignore_devices={}, ignore_virtual={}, ignore_input_media={})",
+                    filter.only_speakers, filter.only_default_speakers, filter.ignore_devices, filter.ignore_virtual, filter.ignore_input_media
+                ));
                 continue;
             }
 
@@ -441,6 +463,67 @@ fn to_shareable_node(node: &NodeRecord) -> ShareableNode {
         media_name,
         binary,
         process_id,
+        media_class: node.prop_str("media.class").map(str::to_string),
+        is_virtual: node.prop_str("node.virtual") == Some("true"),
         is_device: node.is_device(),
     }
+}
+/// Resolves the registry id of the default sink from the live metadata
+/// (`default.audio.sink` -> node.name match), if known.
+fn resolve_default_sink_id(snapshot: &GraphSnapshot) -> Option<u32> {
+    let name = snapshot.default_sink_name.as_ref()?;
+    snapshot
+        .nodes
+        .values()
+        .find(|n| n.prop_str("node.name") == Some(name.as_str()))
+        .map(|n| n.id)
+}
+
+/// Mirrors venmic's `should_link()` decision for a candidate node:
+/// whether it should be routed to the virtual sink given the active route
+/// filter. `only_speakers`/`only_default_speakers` inspect where the
+/// node's audio is *currently* connected on the graph, exactly like
+/// venmic, rather than filtering on static node type alone.
+fn should_link(
+    snapshot: &GraphSnapshot,
+    node: &NodeRecord,
+    filter: &RouteFilter,
+    default_sink_id: Option<u32>,
+) -> bool {
+    if node.is_device() && filter.ignore_devices {
+        return false;
+    }
+    if node.prop_str("node.virtual") == Some("true") && filter.ignore_virtual {
+        return false;
+    }
+    if matches!(node.prop_str("media.class"), Some(c) if c.starts_with("Stream/Input/Audio"))
+        && filter.ignore_input_media
+    {
+        return false;
+    }
+
+    if filter.only_speakers || filter.only_default_speakers {
+        // Which nodes does this node's output currently terminate at?
+        let targets = snapshot.link_targets_of(node.id);
+
+        let reaches_device = targets.iter().any(|target_id| {
+            snapshot
+                .nodes
+                .get(target_id)
+                .is_some_and(|t| t.prop_str("device.id").is_some_and(|v| !v.is_empty()))
+        });
+
+        if filter.only_speakers && !reaches_device {
+            return false;
+        }
+
+        if filter.only_default_speakers {
+            match default_sink_id {
+                Some(sink_id) if targets.contains(&sink_id) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    true
 }
