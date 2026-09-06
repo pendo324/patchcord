@@ -5,7 +5,7 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 #[derive(Debug)]
 pub enum BackendError {
 	Unsupported,
-	Timeout(&'static str),
+	Timeout(String),
 	Io(&'static str, std::io::Error),
 	CommandFailed(&'static str, String),
 	InvalidOutput(&'static str, String),
@@ -15,10 +15,11 @@ pub enum BackendError {
 
 impl BackendError {
 	pub fn is_transient_snapshot_error(&self) -> bool {
-		matches!(
-			self,
-			Self::Json(_) | Self::CommandFailed("pw-dump", _) | Self::InvalidOutput("pw-dump", _) | Self::Timeout("pw-dump")
-		)
+		match self {
+			Self::Json(_) | Self::CommandFailed("pw-dump", _) | Self::InvalidOutput("pw-dump", _) => true,
+			Self::Timeout(name) => name == "pw-dump",
+			_ => false,
+		}
 	}
 }
 

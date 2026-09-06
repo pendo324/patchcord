@@ -187,6 +187,29 @@ fn spawn_stdin_thread(tx: mpsc::Sender<IncomingMessage>) {
 	});
 }
 
+/// Forwards graph-change events from the native backend into the main
+/// protocol loop as `graphChanged` messages, replacing the `pw-mon`
+/// subprocess used by the legacy backend.
+fn spawn_native_event_thread_concrete(
+	events: mpsc::Receiver<patchbay::pw_backend::BackendEvent>,
+	tx: mpsc::Sender<IncomingMessage>,
+) {
+	thread::spawn(move || loop {
+		match events.recv() {
+			Ok(patchbay::pw_backend::BackendEvent::GraphChanged) => {
+				if tx.send(IncomingMessage::GraphChanged).is_err() {
+					return;
+				}
+			}
+			Ok(patchbay::pw_backend::BackendEvent::DefaultSinkChanged(_)) => {
+				// Not currently surfaced in the protocol output; reserved
+				// for the only-default-speakers filter work.
+			}
+			Err(_) => return,
+		}
+	});
+}
+
 /// Spawns `pw-mon` and a monitoring thread.
 fn spawn_pw_mon_thread(tx: mpsc::Sender<IncomingMessage>) -> Option<Child> {
 	let mut child = Command::new("pw-mon")
@@ -226,14 +249,25 @@ fn main() -> io::Result<()> {
 		return run_pw_backend_spike();
 	}
 
+	let legacy_backend = std::env::args().any(|a| a == "--legacy-backend");
+
 	let config = parse_args();
-	let mut patchbay = AudioSharePatchbay::new(&config);
+	let mut patchbay = AudioSharePatchbay::new(&config, legacy_backend);
 	let mut stdout = io::BufWriter::new(io::stdout().lock());
 
 	let (tx, rx) = mpsc::channel();
 
 	spawn_stdin_thread(tx.clone());
-	let monitor_child = spawn_pw_mon_thread(tx);
+
+	// The native backend reports graph changes through its own event
+	// channel (registry global/global_remove listeners); the legacy
+	// backend uses an external `pw-mon` subprocess instead.
+	let monitor_child = if let Some(native_events) = patchbay.take_native_events() {
+		spawn_native_event_thread_concrete(native_events, tx.clone());
+		None
+	} else {
+		spawn_pw_mon_thread(tx)
+	};
 
 	// Main loop: Listen for requests from Node.js or events from PipeWire
 	for msg in rx {
@@ -307,6 +341,25 @@ fn run_pw_backend_spike() -> io::Result<()> {
 
 	let snapshot = backend.snapshot().expect("snapshot failed");
 	println!("Initial snapshot: {} nodes, {} links, default_sink={:?}", snapshot.nodes.len(), snapshot.links.len(), snapshot.default_sink_name);
+	let with_ports = snapshot.nodes.values().filter(|n| n.output_ports().next().is_some()).count();
+	let app_like = snapshot
+		.nodes
+		.values()
+		.filter(|n| {
+			n.prop_str("media.class") == Some("Stream/Output/Audio")
+				&& (n.prop_str("application.name").is_some() || n.prop_str("application.process.binary").is_some())
+		})
+		.collect::<Vec<_>>();
+	println!("  nodes with output ports: {with_ports}, app-like stream nodes: {}", app_like.len());
+	for n in app_like.iter().take(4) {
+		println!(
+			"    node {} name={:?} app={:?} outputs={}",
+			n.id,
+			n.prop_str("node.name"),
+			n.prop_str("application.name"),
+			n.output_ports().count()
+		);
+	}
 
 	assert!(snapshot.nodes.len() > 0, "expected at least one node in the live graph");
 
