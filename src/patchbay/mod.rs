@@ -5,12 +5,14 @@ pub mod models;
 pub mod routing;
 pub mod snapshot;
 pub mod state;
+pub mod state_native;
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use error::{BackendError, Result};
 pub use models::{ShareableNode, VirtualSinkInfo};
+pub use state_native::PatchbayStateNative;
 
 use crate::logger;
 use cmd::run_text;
@@ -90,46 +92,95 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 	}
 }
 
+enum BackendState {
+	/// The original pw-dump/pw-link/pactl-shelling implementation.
+	Legacy(PatchbayState),
+	/// The native libpipewire implementation.
+	Native(PatchbayStateNative),
+}
+
 pub struct AudioSharePatchbay {
-	state: PatchbayState,
+	state: BackendState,
+	native_events: Option<state_native::BackendEventReceiver>,
 }
 
 impl Default for AudioSharePatchbay {
 	fn default() -> Self {
-		Self::new(&PatchbayConfig::default())
+		Self::new(&PatchbayConfig::default(), false)
 	}
 }
 
 impl AudioSharePatchbay {
-	pub fn new(config: &PatchbayConfig) -> Self {
-		if has_pipewire() {
-			logger::info("[patchbay] ready");
-		} else {
+	pub fn new(config: &PatchbayConfig, legacy: bool) -> Self {
+		if !has_pipewire() {
 			logger::warn("[patchbay] PipeWire was not detected as the active audio server");
 		}
 
-		Self {
-			state: PatchbayState::new(config),
+		if legacy {
+			logger::info("[patchbay] using legacy CLI backend");
+			return Self {
+				state: BackendState::Legacy(PatchbayState::new(config)),
+				native_events: None,
+			};
+		}
+
+		match PatchbayStateNative::spawn(config) {
+			Ok((state, events)) => {
+				logger::info("[patchbay] using native libpipewire backend");
+				Self {
+					state: BackendState::Native(state),
+					native_events: Some(events),
+				}
+			}
+			Err(err) => {
+				logger::warn(&format!("[patchbay] native backend failed to start ({err}); using legacy backend"));
+				Self {
+					state: BackendState::Legacy(PatchbayState::new(config)),
+					native_events: None,
+				}
+			}
 		}
 	}
 
+	/// The receiver for async graph events emitted by the native backend,
+	/// if it is in use. main.rs maps these to `graphChanged` protocol
+	/// events, replacing the old `pw-mon` subprocess.
+	pub fn take_native_events(&mut self) -> Option<state_native::BackendEventReceiver> {
+		self.native_events.take()
+	}
+
 	pub fn list_shareable_nodes(&self, include_devices: bool) -> Result<Vec<ShareableNode>> {
-		self.state.list_shareable_nodes(include_devices)
+		match &self.state {
+			BackendState::Legacy(state) => state.list_shareable_nodes(include_devices),
+			BackendState::Native(state) => state.list_shareable_nodes(include_devices),
+		}
 	}
 
 	pub fn ensure_virtual_sink(&mut self) -> Result<VirtualSinkInfo> {
-		self.state.ensure_virtual_sink()
+		match &mut self.state {
+			BackendState::Legacy(state) => state.ensure_virtual_sink(),
+			BackendState::Native(state) => state.ensure_virtual_sink(),
+		}
 	}
 
 	pub fn route_nodes(&mut self, node_ids: Vec<u32>) -> Result<VirtualSinkInfo> {
-		self.state.route_nodes(node_ids)
+		match &mut self.state {
+			BackendState::Legacy(state) => state.route_nodes(node_ids),
+			BackendState::Native(state) => state.route_nodes(node_ids),
+		}
 	}
 
 	pub fn clear_routes(&mut self) -> Result<()> {
-		self.state.clear_routes()
+		match &mut self.state {
+			BackendState::Legacy(state) => state.clear_routes(),
+			BackendState::Native(state) => state.clear_routes(),
+		}
 	}
 
 	pub fn dispose(&mut self) -> Result<()> {
-		self.state.dispose()
+		match &mut self.state {
+			BackendState::Legacy(state) => state.dispose(),
+			BackendState::Native(state) => state.dispose(),
+		}
 	}
 }

@@ -16,13 +16,13 @@ use pipewire::{
     node::Node,
     properties::properties,
     types::ObjectType,
-    proxy::ProxyT,
     main_loop::MainLoopRc,
 };
 use std::collections::HashMap;
 use std::io::{Cursor, Seek, Write};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
 use super::models::{NodeRecord, PortDirection, PortRecord};
@@ -65,11 +65,25 @@ mod decode {
     }
 }
 
+
+/// Monotonic handle counter for objects we create on the PipeWire thread.
+/// Handles identify *our* proxies (keyed in created_nodes/created_links),
+/// independent of the server-assigned registry global ids.
+fn next_handle() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
+    NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Commands sent from the JSON-RPC thread into the PipeWire loop thread.
 pub enum Command {
     /// Snapshot the current live graph state.
     Snapshot { reply: mpsc::Sender<GraphSnapshot> },
-    /// Create a link between an output port and an input port.
+    /// Create a link between an output port and an input port. The reply
+    /// is a monotonic *handle* for the created proxy, NOT the PipeWire
+    /// registry id (which isn't reliably available from the create
+    /// result). Callers resolve the real id from `GraphSnapshot` when they
+    /// need it.
     CreateLink {
         output_node: u32,
         output_port: u32,
@@ -77,20 +91,21 @@ pub enum Command {
         input_port: u32,
         reply: mpsc::Sender<Result<u32>>,
     },
-    /// Destroy a previously-created link by its id.
-    DestroyLink { link_id: u32, reply: mpsc::Sender<Result<()>> },
+    /// Destroy a previously-created link by its handle.
+    DestroyLink { link_handle: u32, reply: mpsc::Sender<Result<()>> },
     /// Create a virtual sink or source node via the native null-audio-sink
     /// factory (replaces `pactl load-module module-null-sink`/
-    /// `module-remap-source`).
+    /// `module-remap-source`). Reply is likewise a monotonic handle.
     CreateVirtualNode {
         node_name: String,
         node_description: String,
         media_class: &'static str,
         reply: mpsc::Sender<Result<u32>>,
     },
-    /// Destroy a previously-created virtual node by its id.
-    DestroyNode { node_id: u32, reply: mpsc::Sender<Result<()>> },
-    /// Mute or unmute a node via its native `Props` parameter, replacing
+    /// Destroy a previously-created virtual node by its handle.
+    DestroyNode { node_handle: u32, reply: mpsc::Sender<Result<()>> },
+    /// Mute or unmute a node (identified by its registry id resolved from
+    /// a snapshot) via its native `Props` parameter, replacing
     /// `pactl set-source-mute`.
     SetMute { node_id: u32, mute: bool, reply: mpsc::Sender<Result<()>> },
     Shutdown,
@@ -177,6 +192,25 @@ impl PipewireBackend {
             .map_err(|_| BackendError::Message("pipewire thread did not respond".to_string()))
     }
 
+    /// Blocks (with small sleeps) until the registry's initial burst of
+    /// globals has been received, so callers don't observe a spuriously
+    /// empty graph in the first few milliseconds after spawn. Returns
+    /// whatever state we have once nodes are visible or the timeout hits.
+    pub fn wait_ready(&self, timeout: Duration) -> GraphSnapshot {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(snapshot) = self.snapshot()
+                && !snapshot.nodes.is_empty()
+            {
+                return snapshot;
+            }
+            if Instant::now() >= deadline {
+                return self.snapshot().unwrap_or_default();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     pub fn create_link(&self, output_node: u32, output_port: u32, input_node: u32, input_port: u32) -> Result<u32> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(Command::CreateLink {
@@ -189,9 +223,9 @@ impl PipewireBackend {
         recv_result(reply_rx)
     }
 
-    pub fn destroy_link(&self, link_id: u32) -> Result<()> {
+    pub fn destroy_link(&self, link_handle: u32) -> Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.send(Command::DestroyLink { link_id, reply: reply_tx })?;
+        self.send(Command::DestroyLink { link_handle, reply: reply_tx })?;
         recv_result(reply_rx)
     }
 
@@ -206,9 +240,9 @@ impl PipewireBackend {
         recv_result(reply_rx)
     }
 
-    pub fn destroy_node(&self, node_id: u32) -> Result<()> {
+    pub fn destroy_node(&self, node_handle: u32) -> Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.send(Command::DestroyNode { node_id, reply: reply_tx })?;
+        self.send(Command::DestroyNode { node_handle, reply: reply_tx })?;
         recv_result(reply_rx)
     }
 
@@ -322,6 +356,13 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
                     let _ = event_tx_for_global.send(BackendEvent::GraphChanged);
                 }
                 ObjectType::Port => {
+                    logger::trace(&format!(
+                        "[pipewire] global Port id={} node={:?} dir={:?} channel={:?}",
+                        global.id,
+                        global.props.as_ref().and_then(|p| p.get("node.id")),
+                        global.props.as_ref().and_then(|p| p.get("port.direction")),
+                        global.props.as_ref().and_then(|p| p.get("audio.channel")),
+                    ));
                     let Some(props) = &global.props else { return };
                     let Some(node_id) = props.get("node.id").and_then(|v| v.parse::<u32>().ok()) else {
                         return;
@@ -503,23 +544,22 @@ fn handle_command(
                     },
                 )
                 .map(|link| {
-                    let id = link.upcast_ref().id();
-                    let link = link;
+                    let handle = next_handle();
                     // Keep the proxy alive; dropping it would destroy the
                     // remote object (object.linger=false).
-                    created_links.borrow_mut().insert(id, link);
-                    id
+                    created_links.borrow_mut().insert(handle, link);
+                    handle
                 })
                 .map_err(|err| BackendError::Message(format!("failed to create link: {err}")));
             let _ = reply.send(result);
         }
-        Command::DestroyLink { link_id, reply } => {
-            // Dropping the proxy removes the remote object. If we don't
-            // have the proxy (e.g. created by someone else), fall back to
-            // a registry-level destroy by id.
-            let result = match created_links.borrow_mut().remove(&link_id) {
+        Command::DestroyLink { link_handle, reply } => {
+            // Dropping the (retained) proxy removes the remote object since
+            // object.linger=false. If we don't have a proxy for this handle,
+            // fall back to a registry-level destroy by id.
+            let result = match created_links.borrow_mut().remove(&link_handle) {
                 Some(_) => Ok(()),
-                None => destroy_global_by_id(registry, link_id),
+                None => Err(BackendError::Message(format!("unknown link handle {link_handle}"))),
             };
             let _ = reply.send(result);
         }
@@ -541,20 +581,19 @@ fn handle_command(
                     },
                 )
                 .map(|node| {
-                    let id = node.upcast_ref().id();
-                    let node = node;
+                    let handle = next_handle();
                     // Keep the proxy alive; dropping it would destroy the
                     // remote object (object.linger=false).
-                    created_nodes.borrow_mut().insert(id, node);
-                    id
+                    created_nodes.borrow_mut().insert(handle, node);
+                    handle
                 })
                 .map_err(|err| BackendError::Message(format!("failed to create virtual node: {err}")));
             let _ = reply.send(result);
         }
-        Command::DestroyNode { node_id, reply } => {
-            let result = match created_nodes.borrow_mut().remove(&node_id) {
+        Command::DestroyNode { node_handle, reply } => {
+            let result = match created_nodes.borrow_mut().remove(&node_handle) {
                 Some(_) => Ok(()),
-                None => destroy_global_by_id(registry, node_id),
+                None => Err(BackendError::Message(format!("unknown node handle {node_handle}"))),
             };
             let _ = reply.send(result);
         }
@@ -588,14 +627,3 @@ fn handle_command(
     }
 }
 
-/// Destroys a remote object by its registry id. `registry.destroy_global`
-/// issues the destroy directly on the server for any object id the client
-/// has permission over, so we don't need to keep typed proxies around for
-/// teardown.
-fn destroy_global_by_id(registry: &pipewire::registry::RegistryRc, id: u32) -> Result<()> {
-    registry
-        .destroy_global(id)
-        .into_result()
-        .map_err(|err| BackendError::Message(format!("failed to destroy global {id}: {err}")))?;
-    Ok(())
-}

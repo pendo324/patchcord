@@ -150,7 +150,7 @@ impl PatchbayState {
 				}
 
 				if Instant::now() >= deadline {
-					return Err(BackendError::Timeout("virtual sink"));
+					return Err(BackendError::Timeout("virtual sink".into()));
 				}
 
 				thread::sleep(Duration::from_millis(200));
