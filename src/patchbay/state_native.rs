@@ -156,7 +156,7 @@ impl PatchbayStateNative {
         let handle = self.backend.create_virtual_node(
             self.session.sink_name.clone(),
             self.session.sink_description.clone(),
-            "Audio/Sink",
+            "Audio/Sink/Virtual",
         )?;
         self.session.sink_handle = Some(handle);
 
@@ -178,23 +178,32 @@ impl PatchbayStateNative {
         }
 
         logger::info(&format!("[patchbay] creating virtual mic wrapper {mic_name}"));
-        let handle = self.backend.create_virtual_node(mic_name.clone(), mic_desc, "Audio/Source")?;
+        let handle = self.backend.create_virtual_node(mic_name.clone(), mic_desc, "Audio/Source/Virtual")?;
         self.session.mic_handle = Some(handle);
 
         self.link_monitor_to_mic()
     }
 
-    /// Links the sink's monitor output ports to the mic source's input
-    /// ports, mirroring venmic's create_mic and PulseAudio's
-    /// module-remap-source (master=<monitor>). Best-effort: port globals
-    /// may not all be visible immediately, in which case we log and let
-    /// the graph-change callback retry. 
+    /// Links the sink's own output ports (a `support.null-audio-sink`
+    /// adapter exposes its monitor as regular output ports on the sink
+    /// node itself -- there is no separate `.monitor` node, unlike a
+    /// PulseAudio module-null-sink) to the mic source adapter's input
+    /// ports. Mirrors venmic's `create_mic`, which creates both sides via
+    /// the identical `support.null-audio-sink` factory (kind::sink vs
+    /// kind::source only changes `media.class`) and links
+    /// receiver-output -> source-input matched by `audio.channel`.
     fn link_monitor_to_mic(&mut self) -> Result<()> {
-        let Some(mic_id) = self.find_mic_id()? else {
+        let Some(mic_name) = self.session.mic_name.clone() else {
             return Ok(());
         };
+        // Wait for both freshly-created adapter nodes to actually appear
+        // in the graph (registry globals for just-created objects can
+        // lag a beat behind the create() call returning) before looking
+        // up their ports below.
+        let mic_id = self.wait_for_node_ready(&mic_name, 2)?;
+        let sink_id = self.wait_for_node_ready(&self.session.sink_name, 2)?;
 
-        // Wait (up to ~3s) for the sink's monitor ports and the mic's
+        // Wait (up to ~3s) for the sink's output ports and the mic's
         // input ports to be visible, then create the FL/FR links. Without
         // them the virtual mic captures silence. Port globals can arrive
         // asynchronously after node creation, so poll the live graph
@@ -202,14 +211,10 @@ impl PatchbayStateNative {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let snapshot = self.backend.snapshot()?;
-            let monitor_name = format!("{}.monitor", self.session.sink_name);
-            let monitor = snapshot
-                .nodes
-                .values()
-                .find(|n| n.prop_str("node.name") == Some(monitor_name.as_str()));
+            let sink = snapshot.nodes.get(&sink_id);
             let mic = snapshot.nodes.get(&mic_id);
 
-            if let (Some(m), Some(mic)) = (monitor, mic) {
+            if let (Some(m), Some(mic)) = (sink, mic) {
                 let outputs = m.output_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
                 let inputs = mic.input_ports().filter(|p| p.path.is_some()).cloned().collect::<Vec<_>>();
 
