@@ -222,6 +222,10 @@ fn spawn_pw_mon_thread(tx: mpsc::Sender<IncomingMessage>) -> Option<Child> {
 }
 
 fn main() -> io::Result<()> {
+	if std::env::args().any(|a| a == "--pw-backend-spike") {
+		return run_pw_backend_spike();
+	}
+
 	let config = parse_args();
 	let mut patchbay = AudioSharePatchbay::new(&config);
 	let mut stdout = io::BufWriter::new(io::stdout().lock());
@@ -281,3 +285,162 @@ fn main() -> io::Result<()> {
 
 	Ok(())
 }
+
+/// Exercises the native `pw_backend` module end-to-end against a live
+/// PipeWire server: connect, snapshot the graph, create a virtual sink,
+/// snapshot again to see it appear, route a real node to it, then tear
+/// everything down. Not part of the real protocol; a manual validation
+/// aid for the pipewire-rs backend rewrite.
+fn run_pw_backend_spike() -> io::Result<()> {
+	use patchbay::pw_backend::{BackendEvent, PipewireBackend};
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	let (event_tx, event_rx) = mpsc::channel();
+
+	println!("Spawning pipewire backend thread...");
+	let backend = PipewireBackend::spawn(event_tx).expect("failed to spawn pipewire backend");
+
+	// Give the registry a moment to receive its initial burst of globals.
+	thread::sleep(Duration::from_millis(300));
+	while event_rx.try_recv().is_ok() {}
+
+	let snapshot = backend.snapshot().expect("snapshot failed");
+	println!("Initial snapshot: {} nodes, {} links, default_sink={:?}", snapshot.nodes.len(), snapshot.links.len(), snapshot.default_sink_name);
+
+	assert!(snapshot.nodes.len() > 0, "expected at least one node in the live graph");
+
+	println!("Creating a virtual sink via the native backend...");
+	let sink_name = format!("pw-backend-spike-sink-{}", std::process::id());
+	match backend.create_virtual_node(sink_name.clone(), "PW Backend Spike Sink".to_string(), "Audio/Sink") {
+		Ok(_) => println!("create_virtual_node command accepted"),
+		Err(err) => println!("create_virtual_node failed: {err}"),
+	}
+
+	// Wait for the registry to observe the new node and report it via
+	// GraphChanged, then confirm it shows up in a fresh snapshot.
+	let mut saw_graph_changed = false;
+	let deadline = std::time::Instant::now() + Duration::from_secs(2);
+	while std::time::Instant::now() < deadline {
+		if let Ok(BackendEvent::GraphChanged) = event_rx.recv_timeout(Duration::from_millis(100)) {
+			saw_graph_changed = true;
+			break;
+		}
+	}
+	println!("Observed GraphChanged event: {saw_graph_changed}");
+
+	let snapshot2 = backend.snapshot().expect("snapshot failed");
+	println!("  post-create snapshot: {} nodes, {} links", snapshot2.nodes.len(), snapshot2.links.len());
+	let interesting: Vec<String> = snapshot2
+		.nodes
+		.values()
+		.filter_map(|n| n.prop_str("node.name").map(str::to_string))
+		.filter(|n| n.contains("patchcord") || n.contains("spike") || n.contains("sink"))
+		.collect();
+	println!("  nodes matching spike/sink: {interesting:?}");
+	let found = snapshot2
+		.nodes
+		.values()
+		.find(|n| n.prop_str("node.name") == Some(sink_name.as_str()))
+		.map(|n| n.id);
+	let sink_id = match found {
+		Some(id) => {
+			println!("SUCCESS: found virtual sink in snapshot, id={id}");
+			id
+		}
+		None => {
+			println!("FAILED: virtual sink not found in post-create snapshot");
+			return Ok(());
+		}
+	};
+
+	// Exercise SetMute: mute the sink, confirm the prop flips, unmute.
+	println!("Muting sink (SetMute=true)...");
+	match backend.set_mute(sink_id, true) {
+		Ok(()) => println!("set_mute(true) ok"),
+		Err(err) => println!("set_mute(true) failed: {err}"),
+	}
+	thread::sleep(Duration::from_millis(150));
+	if let Some(node) = backend.snapshot().ok().and_then(|s| s.nodes.get(&sink_id).cloned()) {
+		println!("  after mute: node.props[\"mute\"]={:?}", node.props.get("mute"));
+	}
+
+	println!("Unmuting sink (SetMute=false)...");
+	match backend.set_mute(sink_id, false) {
+		Ok(()) => println!("set_mute(false) ok"),
+		Err(err) => println!("set_mute(false) failed: {err}"),
+	}
+	thread::sleep(Duration::from_millis(150));
+
+	// Re-mute and hold for external verification (e.g. `pactl list sinks`).
+	println!("Re-muting sink and holding 4s for external verification...");
+	let _ = backend.set_mute(sink_id, true);
+	thread::sleep(Duration::from_secs(4));
+	println!("Done holding.");
+	if let Some(node) = backend.snapshot().ok().and_then(|s| s.nodes.get(&sink_id).cloned()) {
+		println!("  after unmute: node.props[\"mute\"]={:?}", node.props.get("mute"));
+	}
+
+	// Exercise link creation: route one output port of a Stream/Output/Audio
+	// app node to the sink's first input port, confirm it lands in the
+	// live graph, then destroy it.
+	let snapshot3 = backend.snapshot().expect("snapshot failed");
+	let app = snapshot3
+		.nodes
+		.values()
+		.find(|n| n.prop_str("media.class") == Some("Stream/Output/Audio") && n.output_ports().any(|p| p.path.is_some()))
+		.cloned();
+	let sink = snapshot3.nodes.get(&sink_id).cloned();
+	match (app, sink) {
+		(Some(app), Some(sink)) if !app.output_ports().next().is_none() && !sink.input_ports().next().is_none() => {
+			let out_port = app.output_ports().next().expect("app has output port").id;
+			let in_port = sink.input_ports().next().expect("sink has input port").id;
+			println!(
+				"Linking app node {} port {out_port} -> sink {} port {in_port}...",
+				app.id, sink.id
+			);
+			match backend.create_link(app.id, out_port, sink.id, in_port) {
+				Ok(link_id) => {
+					println!("  link created, id={link_id}");
+					thread::sleep(Duration::from_millis(250));
+					let linked = backend.snapshot().ok().is_some_and(|s| {
+						s.links
+							.values()
+							.any(|l| l.output_node == app.id && l.input_node == sink_id)
+					});
+					println!("  link visible in graph: {linked}");
+					let _ = backend.destroy_link(link_id);
+					thread::sleep(Duration::from_millis(200));
+					let gone = !backend.snapshot().ok().is_some_and(|s| {
+						s.links
+							.values()
+							.any(|l| l.output_node == app.id && l.input_node == sink_id)
+					});
+					println!("  link gone after destroy: {gone}");
+				}
+				Err(err) => println!("  create_link failed: {err}"),
+			}
+		}
+		_ => println!("  SKIP: no suitable app/sink node for link test"),
+	}
+
+	// Exercise destroy: remove the sink and confirm it disappears.
+	println!("Destroying sink...");
+	match backend.destroy_node(sink_id) {
+		Ok(()) => println!("destroy_node ok"),
+		Err(err) => println!("destroy_node failed: {err}"),
+	}
+	thread::sleep(Duration::from_millis(150));
+	let still_there = backend
+		.snapshot()
+		.ok()
+		.is_some_and(|s| s.nodes.contains_key(&sink_id));
+	println!("  sink still present after destroy: {still_there}");
+
+	println!("Spike complete, shutting down backend.");
+	drop(backend);
+	thread::sleep(Duration::from_millis(200));
+
+	Ok(())
+}
+

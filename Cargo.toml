@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 miniserde = { git = "https://github.com/Milkshiift/miniserde" }
+pipewire = "0.10"
+libspa = "0.10"
+cookie-factory = "0.3"
 
 [profile.release]
 lto = "fat"
