@@ -177,6 +177,21 @@ impl AudioSharePatchbay {
 		}
 	}
 
+	/// Mutes or unmutes the virtual mic node. Only supported by the
+	/// native backend, since the legacy CLI backend has no direct handle
+	/// to the created PulseAudio/PipeWire objects to apply a mute param
+	/// to; callers should treat an error here as "not supported" and
+	/// fall back to muting/unmuting the consuming getUserMedia track
+	/// instead.
+	pub fn set_virtual_mic_mute(&self, mute: bool) -> Result<()> {
+		match &self.state {
+			BackendState::Legacy(_) => Err(BackendError::Message(
+				"setVirtualMicMute is not supported by the legacy backend".to_string(),
+			)),
+			BackendState::Native(state) => state.set_virtual_mic_mute(mute),
+		}
+	}
+
 	pub fn dispose(&mut self) -> Result<()> {
 		match &mut self.state {
 			BackendState::Legacy(state) => state.dispose(),

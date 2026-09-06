@@ -10,6 +10,16 @@ export interface ShareableNode {
     binary: string | null;
     processId: number | null;
     isDevice: boolean;
+    mediaClass: string | null;
+    isVirtual: boolean;
+}
+
+export interface RouteFilter {
+    onlySpeakers?: boolean;
+    onlyDefaultSpeakers?: boolean;
+    ignoreDevices?: boolean;
+    ignoreVirtual?: boolean;
+    ignoreInputMedia?: boolean;
 }
 
 export interface VirtualSinkInfo {
@@ -39,8 +49,9 @@ export declare class AudioSharePatchbay extends EventEmitter {
     hasPipeWire(): Promise<boolean>;
     listShareableNodes(includeDevices?: boolean): Promise<ShareableNode[]>;
     ensureVirtualSink(): Promise<VirtualSinkInfo>;
-    routeNodes(nodeIds: number[]): Promise<VirtualSinkInfo>;
+    routeNodes(nodeIds: number[], filter?: RouteFilter): Promise<VirtualSinkInfo>;
     clearRoutes(): Promise<void>;
+    setVirtualMicMute(mute: boolean): Promise<void>;
     dispose(): Promise<void>;
 
     on(eventName: 'graphChanged' | 'monitorDied', listener: () => void): this;

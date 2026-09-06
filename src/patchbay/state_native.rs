@@ -38,6 +38,15 @@ pub struct NativeSession {
 
     /// Backend handles for links created to route app output to the sink.
     pub route_link_handles: Vec<u32>,
+
+    /// Backend handles for the sink-monitor -> virtual-mic links created
+    /// by `link_monitor_to_mic`. These are the virtual mic's own
+    /// plumbing, not app routes, and must survive `route_nodes`/
+    /// `clear_routes` calls (which only replace app->sink routes).
+    /// Previously these were stored in `route_link_handles` too, so every
+    /// `routeNodes` call (e.g. from GoofCord's debounced graph-change
+    /// handler) silently destroyed the virtual mic's audio path.
+    pub mic_link_handles: Vec<u32>,
 }
 
 pub struct PatchbayStateNative {
@@ -82,6 +91,7 @@ impl PatchbayStateNative {
             mic_name,
             mic_description,
             route_link_handles: Vec::new(),
+            mic_link_handles: Vec::new(),
         };
 
         Ok((Self { config: config.clone(), backend, session }, event_rx))
@@ -222,8 +232,9 @@ impl PatchbayStateNative {
                     for (output, input) in map_ports(&outputs, &inputs) {
                         let handle = self.backend.create_link(m.id, output.id, mic_id, input.id)?;
                         // Monitor->mic links are part of the virtual mic's
-                        // identity, not "routes"; tracked for cleanup here.
-                        self.session.route_link_handles.push(handle);
+                        // identity, not "routes"; tracked separately so
+                        // route_nodes/clear_routes never touches them.
+                        self.session.mic_link_handles.push(handle);
                     }
                     logger::info(&format!(
                         "[patchbay] linked sink monitor -> virtual mic ({outputs} outputs -> {inputs} inputs)",
@@ -360,6 +371,12 @@ impl PatchbayStateNative {
             errors.push(err.to_string());
         }
 
+        for handle in std::mem::take(&mut self.session.mic_link_handles) {
+            if let Err(err) = self.backend.destroy_link(handle) {
+                errors.push(err.to_string());
+            }
+        }
+
         if let Some(handle) = self.session.mic_handle.take() {
             if let Err(err) = self.backend.destroy_node(handle) {
                 errors.push(err.to_string());
@@ -381,6 +398,17 @@ impl PatchbayStateNative {
 
     fn find_sink_id(&self) -> Result<Option<u32>> {
         self.find_node_id_by_name(&self.session.sink_name)
+    }
+
+    /// Mutes or unmutes the virtual mic node itself (matches venmic's
+    /// "Initial Mute" toggle: mute right after linking to swallow the
+    /// startup audio spike Chromium produces when a new input device
+    /// appears, then unmute once the share is actually live).
+    pub fn set_virtual_mic_mute(&self, mute: bool) -> Result<()> {
+        let Some(mic_id) = self.find_mic_id()? else {
+            return Err(BackendError::Message("virtual mic is not active".to_string()));
+        };
+        self.backend.set_mute(mic_id, mute)
     }
 
     fn find_mic_id(&self) -> Result<Option<u32>> {
