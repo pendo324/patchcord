@@ -1,21 +1,20 @@
-[package]
-name = "patchcord"
-version = "1.0.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = ["crates/patchcord", "crates/discord-capture-shim"]
 
-[dependencies]
-miniserde = { git = "https://github.com/Milkshiift/miniserde" }
-pipewire = "0.10"
-libspa = "0.10"
-cookie-factory = "0.3"
-
+# panic strategy is a profile-wide setting shared by every workspace member
+# (Cargo does not support overriding it per-package the way opt-level/debug
+# can be) -- deliberately left at the default "unwind" rather than "abort"
+# for this reason: discord-capture-shim runs LD_PRELOAD'd *inside* Discord's
+# own process, and a bare panic=abort there would SIGABRT the user's entire
+# running Discord client over what should be, at worst, a no-op for a single
+# stream. The shim's own exported functions additionally wrap all logic in
+# std::panic::catch_unwind (see its source) so a panic can never unwind
+# across the dlsym/FFI boundary into Discord's own C++ code either way (that
+# would be undefined behavior) -- this is belt-and-suspenders, not a
+# substitute for catch_unwind, since "unwind" without a catch would still
+# corrupt the caller's stack once it crosses an extern "C" boundary.
 [profile.release]
 lto = "fat"
 strip = "symbols"
 opt-level = "z"
-panic = "abort"
-
-[lints.clippy]
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-unwrap_used = "deny"

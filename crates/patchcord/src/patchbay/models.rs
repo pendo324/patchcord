@@ -34,6 +34,76 @@ pub struct RouteFilter {
 	pub ignore_input_media: bool,
 }
 
+/// A best-effort hint correlating an in-progress KDE/KWin window-share
+/// (portal ScreenCast session) with a likely audio-producing app, derived
+/// from KWin's own PipeWire video node naming convention.
+///
+/// KWin names its screencast video capture node
+/// `kwin-screencast-<desktopFileName>` (see kwin's
+/// `screencastmanager.cpp`/`screencaststream.cpp`), where
+/// `<desktopFileName>` is the shared window's desktop-file id (e.g.
+/// `org.mozilla.firefox`, `steam`, `code`). This is emitted by the
+/// compositor itself and is visible as a plain PipeWire node regardless of
+/// what opaque source id Chromium/Electron's `getDisplayMedia()` picker
+/// flow hands back to the page -- see `DesktopMediaID::IdType::
+/// kNativePickerSession` in Chromium, which documents that id as opaque
+/// under the native-portal-picker path. Correlating via this node name
+/// sidesteps that opacity entirely.
+///
+/// This is KDE/KWin-specific by construction (GNOME's mutter, if it names
+/// its own screencast nodes at all, almost certainly uses a different
+/// convention that would need separate handling) and only ever fires for
+/// window shares, never full-screen shares (which have no single target
+/// app to correlate against). Callers must treat "no hint" as the normal
+/// case, not an error, and fall back to showing the full unfiltered app
+/// list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreencastHint {
+	/// The raw desktop-file id KWin embedded in the node name, e.g.
+	/// `org.mozilla.firefox` or `steam`.
+	pub desktop_file_id: String,
+	/// A lowercased, reverse-DNS-stripped fragment of `desktop_file_id`
+	/// intended for substring matching against candidate audio nodes'
+	/// `application.name`/`node.name`/`binary` fields, e.g. `firefox` for
+	/// `org.mozilla.firefox`, or `steam` for `steam`.
+	pub hint: String,
+}
+
+const KWIN_SCREENCAST_NODE_PREFIX: &str = "kwin-screencast-";
+
+/// Scans a live node snapshot for a KWin window-screencast video node and
+/// derives a [`ScreencastHint`] from it, if one is currently active.
+/// Shared by both the legacy (`pw-dump`) and native (`libpipewire`)
+/// backends, since both produce the same [`NodeRecord`] shape.
+pub fn find_screencast_hint(nodes: &HashMap<u32, NodeRecord>) -> Option<ScreencastHint> {
+	nodes.values().find_map(|node| {
+		let name = node.prop_str("node.name")?;
+		let desktop_file_id = name.strip_prefix(KWIN_SCREENCAST_NODE_PREFIX)?;
+		if desktop_file_id.is_empty() {
+			return None;
+		}
+
+		// Reverse-DNS ids (org.mozilla.firefox) carry their most specific,
+		// most human-recognizable component last; plain ids (steam, code)
+		// have only one component and are used as-is.
+		let hint = desktop_file_id
+			.rsplit('.')
+			.next()
+			.unwrap_or(desktop_file_id)
+			.to_ascii_lowercase();
+
+		if hint.is_empty() {
+			return None;
+		}
+
+		Some(ScreencastHint {
+			desktop_file_id: desktop_file_id.to_string(),
+			hint,
+		})
+	})
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualSinkInfo {

@@ -33,6 +33,10 @@ export class AudioSharePatchbay extends EventEmitter {
             args.push('--virtual-mic');
         }
 
+        if (options.sinkBecomesDefault) {
+            args.push('--sink-becomes-default');
+        }
+
         if (typeof options.virtualMicName === 'string') {
             args.push('--virtual-mic-name', options.virtualMicName);
         }
@@ -235,6 +239,14 @@ export class AudioSharePatchbay extends EventEmitter {
 
     async setVirtualMicMute(mute) {
         await this.#request('setVirtualMicMute', { mute });
+    }
+
+    async setDefaultSinkToVirtual() {
+        await this.#request('setDefaultSinkToVirtual');
+    }
+
+    async restoreDefaultSink() {
+        await this.#request('restoreDefaultSink');
     }
 
     async dispose() {

@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use error::{BackendError, Result};
-pub use models::{RouteFilter, ShareableNode, VirtualSinkInfo};
+pub use models::{RouteFilter, ScreencastHint, ShareableNode, VirtualSinkInfo};
 pub use state_native::PatchbayStateNative;
 
 use crate::logger;
@@ -28,6 +28,25 @@ pub struct PatchbayConfig {
 	pub virtual_mic: bool,
 	pub virtual_mic_name: Option<String>,
 	pub virtual_mic_description: Option<String>,
+	/// Creates the virtual sink with plain `Audio/Sink` media class instead
+	/// of `Audio/Sink/Virtual`. Required for `set_default_sink_to_virtual`
+	/// to actually work: WirePlumber's default-node policy
+	/// (default-nodes/rescan.lua) only ever considers `Audio/Sink` and
+	/// `Audio/Duplex` nodes as sink-default candidates, so an
+	/// `Audio/Sink/Virtual` node can be *written* into
+	/// `default.configured.audio.sink` (confirmed via `wpctl status`
+	/// showing it under "Default Configured Devices") but never actually
+	/// becomes the effective default (`default.audio.sink`), with and
+	/// without a virtual mic attached.
+	///
+	/// Trade-off: plain `Audio/Sink` also changes the adapter's port
+	/// negotiation such that `link_monitor_to_mic`'s 2in/2out topology
+	/// assumption breaks, and mic linking silently times out.
+	/// Since this flag exists specifically for app-only-audio screenshare,
+	/// which has no need for a virtual mic at all, mutual exclusivity with
+	/// `virtual_mic` is enforced by `AudioSharePatchbay::new` rather than
+	/// attempting to support both at once.
+	pub sink_becomes_default: bool,
 }
 
 impl Default for PatchbayConfig {
@@ -38,6 +57,7 @@ impl Default for PatchbayConfig {
 			virtual_mic: false,
 			virtual_mic_name: None,
 			virtual_mic_description: None,
+			sink_becomes_default: false,
 		}
 	}
 }
@@ -116,6 +136,20 @@ impl AudioSharePatchbay {
 			logger::warn("[patchbay] PipeWire was not detected as the active audio server");
 		}
 
+		let mut config = config.clone();
+		if config.sink_becomes_default && config.virtual_mic {
+			// See the doc comment on sink_becomes_default: the two features
+			// require mutually incompatible sink media classes. Disable
+			// virtual_mic rather than silently letting mic-link setup fail
+			// later with a confusing timeout.
+			logger::warn(
+				"[patchbay] sink_becomes_default and virtual_mic are mutually exclusive; \
+				 disabling virtual_mic for this session",
+			);
+			config.virtual_mic = false;
+		}
+		let config = &config;
+
 		if legacy {
 			logger::info("[patchbay] using legacy CLI backend");
 			return Self {
@@ -156,6 +190,18 @@ impl AudioSharePatchbay {
 		}
 	}
 
+	/// Best-effort correlation of an in-progress KDE/KWin window-share with
+	/// a likely audio-producing app; see [`ScreencastHint`]'s doc comment
+	/// for the mechanism and its limits. `None` means "no active window
+	/// share detected" or "not on KWin" -- callers should treat that as
+	/// the normal case and fall back to the full unfiltered node list.
+	pub fn find_screencast_hint(&self) -> Result<Option<ScreencastHint>> {
+		match &self.state {
+			BackendState::Legacy(state) => state.find_screencast_hint(),
+			BackendState::Native(state) => state.find_screencast_hint(),
+		}
+	}
+
 	pub fn ensure_virtual_sink(&mut self) -> Result<VirtualSinkInfo> {
 		match &mut self.state {
 			BackendState::Legacy(state) => state.ensure_virtual_sink(),
@@ -189,6 +235,27 @@ impl AudioSharePatchbay {
 				"setVirtualMicMute is not supported by the legacy backend".to_string(),
 			)),
 			BackendState::Native(state) => state.set_virtual_mic_mute(mute),
+		}
+	}
+
+	/// Makes the virtual sink the system default audio sink, remembering
+	/// the prior default. Only supported by the native backend (the legacy
+	/// CLI backend has no `pactl set-default-sink` equivalent wired up).
+	pub fn set_default_sink_to_virtual(&mut self) -> Result<()> {
+		match &mut self.state {
+			BackendState::Legacy(_) => Err(BackendError::Message(
+				"setDefaultSinkToVirtual is not supported by the legacy backend".to_string(),
+			)),
+			BackendState::Native(state) => state.set_default_sink_to_virtual(),
+		}
+	}
+
+	/// Restores the system default sink overridden by
+	/// `set_default_sink_to_virtual`, if any.
+	pub fn restore_default_sink(&mut self) -> Result<()> {
+		match &mut self.state {
+			BackendState::Legacy(_) => Ok(()),
+			BackendState::Native(state) => state.restore_default_sink(),
 		}
 	}
 

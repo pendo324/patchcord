@@ -108,6 +108,13 @@ pub enum Command {
     /// a snapshot) via its native `Props` parameter, replacing
     /// `pactl set-source-mute`.
     SetMute { node_id: u32, mute: bool, reply: mpsc::Sender<Result<()>> },
+    /// Sets (or clears, if `sink_name` is `None`) the system default audio
+    /// sink by writing PipeWire's `default.audio.sink` metadata key,
+    /// replacing `pactl set-default-sink`. Used to make a virtual sink the
+    /// system default for the duration of an app-only screenshare, since
+    /// Discord's real "Stream With Audio" capture always grabs the
+    /// *default* sink's monitor rather than a chosen node directly.
+    SetDefaultSink { sink_name: Option<String>, reply: mpsc::Sender<Result<()>> },
     Shutdown,
 }
 
@@ -252,6 +259,16 @@ impl PipewireBackend {
         recv_result(reply_rx)
     }
 
+    /// Sets the system default audio sink, by name (matching
+    /// `NodeRecord.props["node.name"]`), or clears it if `sink_name` is
+    /// `None`. Errors if the "default" metadata object hasn't been seen by
+    /// the registry yet; callers should retry briefly after startup if so.
+    pub fn set_default_sink(&self, sink_name: Option<String>) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send(Command::SetDefaultSink { sink_name, reply: reply_tx })?;
+        recv_result(reply_rx)
+    }
+
     fn send(&self, command: Command) -> Result<()> {
         self.command_tx
             .send(command)
@@ -308,6 +325,14 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
     // removes the object from PipeWire.
     let created_nodes = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<u32, Node>::new()));
     let created_links = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<u32, Link>::new()));
+    // Writable handle to the "default" metadata object, populated once the
+    // registry sees it (see the metadata listener below). Needed for
+    // SetDefaultSink; kept separate from the read-only tracking done via
+    // the same bind, since that binding's own listener leaks its Metadata
+    // proxy via mem::forget and we need a live handle to call
+    // set_property on later.
+    let default_metadata: std::rc::Rc<std::cell::RefCell<Option<pipewire::metadata::Metadata>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let state_for_global = state.clone();
     let port_owner_for_global = port_owner.clone();
@@ -429,6 +454,7 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
     let state_for_metadata = state.clone();
     let event_tx_for_metadata = event_tx.clone();
     let registry_for_metadata = registry.clone();
+    let default_metadata_for_global = default_metadata.clone();
     let _metadata_listener = registry
         .add_listener_local()
         .global(move |global| {
@@ -449,6 +475,17 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
                 Ok(m) => m,
                 Err(_) => return,
             };
+
+            // Separate bind for writes (SetDefaultSink): Metadata isn't
+            // Clone, and the read-side proxy below is intentionally leaked
+            // via mem::forget to keep its listener alive, so we can't reuse
+            // it here. Binding twice against the same server-side object is
+            // cheap (just another proxy), and gives handle_command a live
+            // handle to call set_property on independent of the listener's
+            // lifetime.
+            if let Ok(writable) = registry_for_metadata.bind::<pipewire::metadata::Metadata, _>(global) {
+                *default_metadata_for_global.borrow_mut() = Some(writable);
+            }
 
             let state = state_for_metadata.clone();
             let event_tx = event_tx_for_metadata.clone();
@@ -483,6 +520,7 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
     let known_globals_for_commands = known_globals.clone();
     let created_nodes_for_commands = created_nodes.clone();
     let created_links_for_commands = created_links.clone();
+    let default_metadata_for_commands = default_metadata.clone();
 
     let _command_listener = command_rx.attach(mainloop.loop_(), move |command| {
         handle_command(
@@ -491,6 +529,7 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
             &known_globals_for_commands,
             &created_nodes_for_commands,
             &created_links_for_commands,
+            &default_metadata_for_commands,
             &state_for_commands,
             &mainloop_for_commands,
             command,
@@ -517,6 +556,7 @@ fn handle_command(
     >,
     created_nodes: &std::rc::Rc<std::cell::RefCell<HashMap<u32, Node>>>,
     created_links: &std::rc::Rc<std::cell::RefCell<HashMap<u32, Link>>>,
+    default_metadata: &std::rc::Rc<std::cell::RefCell<Option<pipewire::metadata::Metadata>>>,
     state: &std::rc::Rc<std::cell::RefCell<GraphSnapshot>>,
     mainloop: &MainLoopRc,
     command: Command,
@@ -617,6 +657,48 @@ fn handle_command(
 
                 node.set_param(libspa::param::ParamType::Props, 0, pod);
 
+                Ok(())
+            })();
+            let _ = reply.send(result);
+        }
+        Command::SetDefaultSink { sink_name, reply } => {
+            let result = (|| {
+                let metadata = default_metadata.borrow();
+                let metadata = metadata.as_ref().ok_or_else(|| {
+                    BackendError::Message("default metadata object not available yet".to_string())
+                })?;
+
+                // Value format matches what PipeWire itself writes/reads
+                // for this key: a small JSON object {"name": "<sink>"}.
+                // subject 0 is PipeWire's convention for "no specific
+                // client, this is a wildcard/global default" (mirrors
+                // pactl set-default-sink's own wpctl/pw-metadata usage).
+                //
+                // Must write `default.configured.audio.sink`, NOT
+                // `default.audio.sink`: the latter is a read-only mirror
+                // that WirePlumber's policy manager recomputes from the
+                // former and reasserts on any change (confirmed live:
+                // writing default.audio.sink directly took effect for a
+                // moment in `pw-metadata` output but pactl/wpctl still
+                // reported the old default seconds later, because
+                // WirePlumber immediately wrote its own recomputed value
+                // back over ours). `default.configured.audio.sink` is the
+                // actual user-facing "pin this as default" key --
+                // confirmed by observing `pactl set-default-sink` only
+                // ever touches that key, never `default.audio.sink`
+                // directly.
+                let value = sink_name.as_deref().map(|name| {
+                    let mut escaped = String::with_capacity(name.len());
+                    for ch in name.chars() {
+                        if ch == '"' || ch == '\\' {
+                            escaped.push('\\');
+                        }
+                        escaped.push(ch);
+                    }
+                    format!("{{\"name\":\"{escaped}\"}}")
+                });
+
+                metadata.set_property(0, "default.configured.audio.sink", Some("Spa:String:JSON"), value.as_deref());
                 Ok(())
             })();
             let _ = reply.send(result);

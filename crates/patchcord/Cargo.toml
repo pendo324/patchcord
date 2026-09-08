@@ -1,0 +1,15 @@
+[package]
+name = "patchcord"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+miniserde = { git = "https://github.com/Milkshiift/miniserde" }
+pipewire = "0.10"
+libspa = "0.10"
+cookie-factory = "0.3"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"

@@ -40,6 +40,15 @@ export interface AudioSharePatchbayOptions {
     sinkPrefix?: string;
     sinkDescription?: string;
     virtualMic?: boolean;
+    /**
+     * Creates the virtual sink as a plain Audio/Sink (rather than
+     * Audio/Sink/Virtual) and makes it the system default sink once ready,
+     * so app-routed audio actually reaches Discord's own "Stream With
+     * Audio" capture (which always grabs the *default* sink's monitor).
+     * Mutually exclusive with virtualMic -- see PatchbayConfig's Rust doc
+     * comment for why.
+     */
+    sinkBecomesDefault?: boolean;
     virtualMicName?: string;
     virtualMicDescription?: string;
 }
@@ -52,6 +61,8 @@ export declare class AudioSharePatchbay extends EventEmitter {
     routeNodes(nodeIds: number[], filter?: RouteFilter): Promise<VirtualSinkInfo>;
     clearRoutes(): Promise<void>;
     setVirtualMicMute(mute: boolean): Promise<void>;
+    setDefaultSinkToVirtual(): Promise<void>;
+    restoreDefaultSink(): Promise<void>;
     dispose(): Promise<void>;
 
     on(eventName: 'graphChanged' | 'monitorDied', listener: () => void): this;
