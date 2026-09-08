@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::cmd::{create_link, remove_link, run_text};
 use super::error::{BackendError, Result};
-use super::models::{NodeRecord, Route, ShareableNode, VirtualSinkInfo};
+use super::models::{self, NodeRecord, Route, ScreencastHint, ShareableNode, VirtualSinkInfo};
 use super::routing::map_ports;
 use super::snapshot::PipeWireSnapshot;
 use super::{PatchbayConfig, ensure_pipewire};
@@ -96,6 +96,12 @@ impl PatchbayState {
 		});
 
 		Ok(nodes)
+	}
+
+	pub fn find_screencast_hint(&self) -> Result<Option<ScreencastHint>> {
+		ensure_pipewire()?;
+		let snapshot = PipeWireSnapshot::collect()?;
+		Ok(models::find_screencast_hint(&snapshot.nodes))
 	}
 
 	pub fn ensure_virtual_sink(&mut self) -> Result<VirtualSinkInfo> {

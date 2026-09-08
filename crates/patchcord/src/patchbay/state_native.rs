@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
-use super::models::{NodeRecord, RouteFilter, ShareableNode, VirtualSinkInfo};
+use super::models::{self, NodeRecord, RouteFilter, ScreencastHint, ShareableNode, VirtualSinkInfo};
 use super::pw_backend::{BackendEvent, GraphSnapshot, PipewireBackend};
 use super::routing::map_ports;
 use super::PatchbayConfig;
@@ -47,6 +47,13 @@ pub struct NativeSession {
     /// `routeNodes` call (e.g. from GoofCord's debounced graph-change
     /// handler) silently destroyed the virtual mic's audio path.
     pub mic_link_handles: Vec<u32>,
+
+    /// The system default sink's name from just before
+    /// `set_default_sink_to_virtual` last overrode it, if any. Used to
+    /// restore the user's real default sink when the app-audio-only
+    /// screenshare session ends, so we don't leave the virtual sink
+    /// permanently claiming "default" after Discord's share stops.
+    pub prior_default_sink: Option<String>,
 }
 
 pub struct PatchbayStateNative {
@@ -92,6 +99,7 @@ impl PatchbayStateNative {
             mic_description,
             route_link_handles: Vec::new(),
             mic_link_handles: Vec::new(),
+            prior_default_sink: None,
         };
 
         Ok((Self { config: config.clone(), backend, session }, event_rx))
@@ -156,6 +164,14 @@ impl PatchbayStateNative {
         Ok(nodes)
     }
 
+    /// Best-effort correlation of an in-progress KDE/KWin window-share;
+    /// see [`ScreencastHint`]'s doc comment. `None` is the normal case
+    /// (no active window share, or not on KWin).
+    pub fn find_screencast_hint(&self) -> Result<Option<ScreencastHint>> {
+        let snapshot = self.backend.snapshot()?;
+        Ok(models::find_screencast_hint(&snapshot.nodes))
+    }
+
     pub fn ensure_virtual_sink(&mut self) -> Result<VirtualSinkInfo> {
         if let Some(info) = self.virtual_sink_info()? {
             self.ensure_virtual_mic()?;
@@ -166,7 +182,7 @@ impl PatchbayStateNative {
         let handle = self.backend.create_virtual_node(
             self.session.sink_name.clone(),
             self.session.sink_description.clone(),
-            "Audio/Sink/Virtual",
+            if self.config.sink_becomes_default { "Audio/Sink" } else { "Audio/Sink/Virtual" },
         )?;
         self.session.sink_handle = Some(handle);
 
@@ -174,6 +190,10 @@ impl PatchbayStateNative {
 
         let sink_id = self.wait_for_node_ready(&self.session.sink_name, 2)?;
         logger::info(&format!("[patchbay] virtual sink ready: {} (node id {sink_id})", self.session.sink_name));
+
+        if self.config.sink_becomes_default {
+            self.set_default_sink_to_virtual()?;
+        }
 
         self.virtual_sink_info()?
             .ok_or_else(|| BackendError::Message("virtual sink not found after creation".to_string()))
@@ -367,6 +387,15 @@ impl PatchbayStateNative {
 
     pub fn dispose(&mut self) -> Result<()> {
         let mut errors = Vec::<String>::new();
+
+        // Restore the real default sink first, before tearing down the
+        // virtual sink itself: doing it after would leave a brief window
+        // (or, if this errors, potentially forever) where the system
+        // default points at a sink that no longer exists.
+        if let Err(err) = self.restore_default_sink() {
+            errors.push(err.to_string());
+        }
+
         if let Err(err) = self.clear_routes() {
             errors.push(err.to_string());
         }
@@ -409,6 +438,31 @@ impl PatchbayStateNative {
             return Err(BackendError::Message("virtual mic is not active".to_string()));
         };
         self.backend.set_mute(mic_id, mute)
+    }
+
+    /// Makes the virtual sink the system default, remembering the prior
+    /// default so it can be restored later. Needed because Discord's real
+    /// "Stream With Audio" screenshare capture always grabs the *default*
+    /// sink's monitor, not a specific chosen node -- so routing only the
+    /// selected app(s) into the virtual sink isn't enough on its own; the
+    /// virtual sink must also become "the" default for the duration of the
+    /// share for Discord to actually pick its audio up.
+    pub fn set_default_sink_to_virtual(&mut self) -> Result<()> {
+        let snapshot = self.backend.snapshot()?;
+        if self.session.prior_default_sink.is_none() {
+            self.session.prior_default_sink = snapshot.default_sink_name.clone();
+        }
+        self.backend.set_default_sink(Some(self.session.sink_name.clone()))
+    }
+
+    /// Restores the system default sink to whatever it was before
+    /// `set_default_sink_to_virtual` was called, if anything was recorded.
+    /// Safe to call even if the default was never overridden (no-op).
+    pub fn restore_default_sink(&mut self) -> Result<()> {
+        let Some(prior) = self.session.prior_default_sink.take() else {
+            return Ok(());
+        };
+        self.backend.set_default_sink(Some(prior))
     }
 
     fn find_mic_id(&self) -> Result<Option<u32>> {

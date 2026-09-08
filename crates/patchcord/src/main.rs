@@ -29,6 +29,9 @@ enum Request {
 		include_devices: bool,
 	},
 
+	#[serde(rename = "findScreencastHint")]
+	FindScreencastHint { id: u64 },
+
 	#[serde(rename = "ensureVirtualSink")]
 	EnsureVirtualSink { id: u64 },
 
@@ -59,6 +62,12 @@ enum Request {
 
 	#[serde(rename = "setVirtualMicMute")]
 	SetVirtualMicMute { id: u64, mute: bool },
+
+	#[serde(rename = "setDefaultSinkToVirtual")]
+	SetDefaultSinkToVirtual { id: u64 },
+
+	#[serde(rename = "restoreDefaultSink")]
+	RestoreDefaultSink { id: u64 },
 
 	#[serde(rename = "dispose")]
 	Dispose { id: u64 },
@@ -124,6 +133,9 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 		Request::ListShareableNodes { id, include_devices } => {
 			write_result(out, id, patchbay.list_shareable_nodes(include_devices))?;
 		}
+		Request::FindScreencastHint { id } => {
+			write_result(out, id, patchbay.find_screencast_hint())?;
+		}
 		Request::EnsureVirtualSink { id } => {
 			write_result(out, id, patchbay.ensure_virtual_sink())?;
 		}
@@ -150,6 +162,12 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 		}
 		Request::SetVirtualMicMute { id, mute } => {
 			write_result(out, id, patchbay.set_virtual_mic_mute(mute))?;
+		}
+		Request::SetDefaultSinkToVirtual { id } => {
+			write_result(out, id, patchbay.set_default_sink_to_virtual())?;
+		}
+		Request::RestoreDefaultSink { id } => {
+			write_result(out, id, patchbay.restore_default_sink())?;
 		}
 		Request::Dispose { id } => {
 			write_result(out, id, patchbay.dispose())?;
@@ -178,6 +196,9 @@ fn parse_args() -> PatchbayConfig {
 			}
 			"--virtual-mic" => {
 				config.virtual_mic = true;
+			}
+			"--sink-becomes-default" => {
+				config.sink_becomes_default = true;
 			}
 			"--virtual-mic-name" => {
 				if let Some(val) = args.next() {
