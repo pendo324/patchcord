@@ -8,6 +8,7 @@ miniserde = { git = "https://github.com/Milkshiift/miniserde" }
 pipewire = "0.10"
 libspa = "0.10"
 cookie-factory = "0.3"
+libc = "0.2"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

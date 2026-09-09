@@ -259,6 +259,39 @@ impl AudioSharePatchbay {
 		}
 	}
 
+	/// Routes the given node id(s) directly into every one of Discord's
+	/// own `discord_capture` screenshare-audio nodes, replacing whatever
+	/// selection (if any) was previously routed there. Pass an empty
+	/// list to stop routing anything (existing links torn down, no
+	/// virtual sink/mic involved -- see `state_native`'s own doc comment
+	/// for why this needs no sink at all, unlike `route_nodes`). Only
+	/// supported by the native backend: the legacy CLI backend has no
+	/// live graph-change reactivity to keep this correctly synced as
+	/// Discord creates fresh `discord_capture` nodes over time.
+	pub fn set_discord_capture_targets(&mut self, node_ids: Vec<u32>, filter: RouteFilter) -> Result<()> {
+		match &mut self.state {
+			BackendState::Legacy(_) => Err(BackendError::Message(
+				"setDiscordCaptureTargets is not supported by the legacy backend".to_string(),
+			)),
+			BackendState::Native(state) => state.set_discord_capture_targets(node_ids, filter),
+		}
+	}
+
+	/// Re-applies the current `set_discord_capture_targets` selection
+	/// against the live graph; called on every `graphChanged` event (see
+	/// main.rs) so a freshly-created `discord_capture` node gets linked
+	/// without a client round-trip. No-op (`Ok(())`) on the legacy
+	/// backend, which doesn't support the `discord_capture` path at all --
+	/// deliberately not an error here, since main.rs calls this
+	/// unconditionally on every graph change regardless of which backend
+	/// ended up active.
+	pub fn sync_discord_capture_links(&mut self) -> Result<()> {
+		match &mut self.state {
+			BackendState::Legacy(_) => Ok(()),
+			BackendState::Native(state) => state.sync_discord_capture_links(),
+		}
+	}
+
 	pub fn dispose(&mut self) -> Result<()> {
 		match &mut self.state {
 			BackendState::Legacy(state) => state.dispose(),

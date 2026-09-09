@@ -218,6 +218,10 @@ export class AudioSharePatchbay extends EventEmitter {
         return this.#request('listShareableNodes', { includeDevices });
     }
 
+    async findScreencastHint() {
+        return this.#request('findScreencastHint');
+    }
+
     async ensureVirtualSink() {
         return this.#request('ensureVirtualSink');
     }
@@ -247,6 +251,37 @@ export class AudioSharePatchbay extends EventEmitter {
 
     async restoreDefaultSink() {
         await this.#request('restoreDefaultSink');
+    }
+
+    /**
+     * Routes the given node id(s) directly into every one of Discord's own
+     * `discord_capture` screenshare-audio nodes (see the Rust
+     * `NodeRecord::is_discord_capture` doc comment for the full
+     * background), replacing whatever selection was previously routed
+     * there. Pass an empty array to stop routing anything. Requires
+     * `discord-capture-shim` to be `LD_PRELOAD`'d into the Discord
+     * process, or `discord_capture` nodes will keep auto-linking
+     * themselves to every detected app regardless of this call -- see
+     * that crate's own doc comment.
+     *
+     * `filter` is the same `RouteFilter` shape `routeNodes` takes,
+     * applied server-side with the identical `should_link` decision (see
+     * patchcord's `state_native.rs`) -- passing e.g. `onlySpeakers` here
+     * behaves the same as it does for `routeNodes`.
+     *
+     * Unlike `routeNodes`, this needs no prior `ensureVirtualSink` call:
+     * `discord_capture` is Discord's own node, read directly in-process,
+     * so there's no virtual sink/mic to create or swap into.
+     */
+    async setDiscordCaptureTargets(nodeIds, filter = {}) {
+        await this.#request('setDiscordCaptureTargets', {
+            nodeIds,
+            onlySpeakers: filter.onlySpeakers ?? false,
+            onlyDefaultSpeakers: filter.onlyDefaultSpeakers ?? false,
+            ignoreDevices: filter.ignoreDevices ?? false,
+            ignoreVirtual: filter.ignoreVirtual ?? false,
+            ignoreInputMedia: filter.ignoreInputMedia ?? false,
+        });
     }
 
     async dispose() {

@@ -2,12 +2,18 @@
 name = "discord-capture-shim"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
 
+[[bin]]
+name = "discord-capture-setup"
+path = "src/bin/setup.rs"
+
 [dependencies]
 libc = "0.2"
+arwen = "0.0.5"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

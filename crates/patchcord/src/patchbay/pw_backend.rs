@@ -93,6 +93,13 @@ pub enum Command {
     },
     /// Destroy a previously-created link by its handle.
     DestroyLink { link_handle: u32, reply: mpsc::Sender<Result<()>> },
+    /// Destroy an arbitrary live link by its registry id, NOT one of
+    /// this process's own `created_links` handles -- e.g. a link
+    /// PulseAudio/`discord-capture-shim` created on Discord's own
+    /// behalf, which patchcord never called `create_link` for and so
+    /// has no handle for. Uses `Registry::destroy_global` directly
+    /// rather than needing a bound proxy first.
+    DestroyLinkById { link_id: u32, reply: mpsc::Sender<Result<()>> },
     /// Create a virtual sink or source node via the native null-audio-sink
     /// factory (replaces `pactl load-module module-null-sink`/
     /// `module-remap-source`). Reply is likewise a monotonic handle.
@@ -236,6 +243,12 @@ impl PipewireBackend {
         recv_result(reply_rx)
     }
 
+    pub fn destroy_link_by_id(&self, link_id: u32) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send(Command::DestroyLinkById { link_id, reply: reply_tx })?;
+        recv_result(reply_rx)
+    }
+
     pub fn create_virtual_node(&self, node_name: String, node_description: String, media_class: &'static str) -> Result<u32> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(Command::CreateVirtualNode {
@@ -325,6 +338,18 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
     // removes the object from PipeWire.
     let created_nodes = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<u32, Node>::new()));
     let created_links = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<u32, Link>::new()));
+    // Bound proxy + listener for every *observed* (not created by us)
+    // Node global, keyed by registry id. Needed because dynamic property
+    // updates on an existing node (e.g. a browser tab's `media.name`
+    // changing as the page title changes) are NOT delivered via the
+    // registry's own `global` callback -- that only fires once at
+    // announce time plus on removal; a node's `media.name` observed via
+    // this registry-only path stays permanently stale. Property changes
+    // are instead delivered to
+    // a bound `Node` proxy's own `info` listener, which is why every
+    // observed node needs one bound and kept alive here. Entries are
+    // removed (dropping the proxy+listener) in `global_remove` below.
+    let node_watchers = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<u32, (Node, pipewire::node::NodeListener)>::new()));
     // Writable handle to the "default" metadata object, populated once the
     // registry sees it (see the metadata listener below). Needed for
     // SetDefaultSink; kept separate from the read-only tracking done via
@@ -338,11 +363,14 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
     let port_owner_for_global = port_owner.clone();
     let known_globals_for_global = known_globals.clone();
     let event_tx_for_global = event_tx.clone();
+    let node_watchers_for_global = node_watchers.clone();
+    let registry_for_node_watch = registry.clone();
 
     let state_for_remove = state.clone();
     let port_owner_for_remove = port_owner.clone();
     let known_globals_for_remove = known_globals.clone();
     let event_tx_for_remove = event_tx.clone();
+    let node_watchers_for_remove = node_watchers;
 
     let _global_listener = registry
         .add_listener_local()
@@ -379,6 +407,40 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
 
                     state_for_global.borrow_mut().nodes.insert(global.id, record);
                     let _ = event_tx_for_global.send(BackendEvent::GraphChanged);
+
+                    // Bind a Node proxy and listen for future info/prop
+                    // updates on this exact node (see node_watchers'
+                    // own doc comment for why this is necessary at all
+                    // -- the registry-level `global` callback above only
+                    // ever fires once per node's lifetime, at creation).
+                    // Skipped if we've already bound this id (can't
+                    // happen for a genuinely new node, but global() could
+                    // in principle re-fire for the same id in some
+                    // PipeWire server implementations; re-binding would
+                    // just leak the old proxy for no benefit).
+                    if !node_watchers_for_global.borrow().contains_key(&global.id) {
+                        if let Ok(node) = registry_for_node_watch.bind::<Node, _>(global) {
+                            let node_id = global.id;
+                            let state_for_info = state_for_global.clone();
+                            let event_tx_for_info = event_tx_for_global.clone();
+                            let listener = node
+                                .add_listener_local()
+                                .info(move |info| {
+                                    let Some(props) = info.props() else { return };
+                                    let mut state = state_for_info.borrow_mut();
+                                    let Some(record) = state.nodes.get_mut(&node_id) else { return };
+                                    for (key, value) in props.iter() {
+                                        record
+                                            .props
+                                            .insert(key.to_string(), miniserde::json::Value::String(value.to_string()));
+                                    }
+                                    drop(state);
+                                    let _ = event_tx_for_info.send(BackendEvent::GraphChanged);
+                                })
+                                .register();
+                            node_watchers_for_global.borrow_mut().insert(global.id, (node, listener));
+                        }
+                    }
                 }
                 ObjectType::Port => {
                     logger::trace(&format!(
@@ -444,6 +506,7 @@ fn run_loop(command_rx: pipewire::channel::Receiver<Command>, event_tx: mpsc::Se
             state.links.remove(&id);
             port_owner_for_remove.borrow_mut().remove(&id);
             known_globals_for_remove.borrow_mut().remove(&id);
+            node_watchers_for_remove.borrow_mut().remove(&id);
             let _ = event_tx_for_remove.send(BackendEvent::GraphChanged);
         })
         .register();
@@ -601,6 +664,31 @@ fn handle_command(
                 Some(_) => Ok(()),
                 None => Err(BackendError::Message(format!("unknown link handle {link_handle}"))),
             };
+            let _ = reply.send(result);
+        }
+        Command::DestroyLinkById { link_id, reply } => {
+            // Unlike DestroyLink, this is for links this process never
+            // created a proxy for at all (see this variant's own doc
+            // comment) -- destroy_global works directly off the
+            // registry id with no proxy/handle involved.
+            //
+            // into_result() (accepting either a sync OR an async
+            // success), not into_sync_result(): destroy_global genuinely
+            // returns an asynchronous success in practice (the actual
+            // object removal is confirmed later via the registry's own
+            // global_remove callback, not synchronously here) --
+            // into_sync_result() panics on an
+            // async result ("result is an asynchronous success"), which
+            // crashed this entire dedicated PipeWire thread outright
+            // (an unwinding panic inside a callback PipeWire itself
+            // invokes via C FFI becomes an abort, since it can't safely
+            // unwind across that boundary), taking down every other
+            // in-flight patchbay operation with it.
+            let result = registry
+                .destroy_global(link_id)
+                .into_result()
+                .map(|_| ())
+                .map_err(|err| BackendError::Message(format!("failed to destroy link {link_id}: {err}")));
             let _ = reply.send(result);
         }
         Command::CreateVirtualNode {
