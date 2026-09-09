@@ -20,11 +20,16 @@ pub struct ShareableNode {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+// Each field is an independent, orthogonal filter toggle deserialized
+// directly from the RouteFilter JSON-RPC param object; splitting these
+// into a bitflags type or sub-structs would only make the JSON-RPC
+// deserialization and call sites more awkward for no real benefit.
+#[allow(clippy::struct_excessive_bools)]
 pub struct RouteFilter {
 	/// When sharing many nodes at once, only keep nodes whose current
 	/// output actually reaches a device (speaker) on the graph.
 	pub only_speakers: bool,
-	/// Like only_speakers, but must reach the *default* sink specifically.
+	/// Like `only_speakers`, but must reach the *default* sink specifically.
 	pub only_default_speakers: bool,
 	/// Exclude device nodes (mic/speaker) from being routed.
 	pub ignore_devices: bool,
@@ -35,15 +40,15 @@ pub struct RouteFilter {
 }
 
 /// A best-effort hint correlating an in-progress KDE/KWin window-share
-/// (portal ScreenCast session) with a likely audio-producing app, derived
-/// from KWin's own PipeWire video node naming convention.
+/// (portal `ScreenCast` session) with a likely audio-producing app, derived
+/// from `KWin`'s own `PipeWire` video node naming convention.
 ///
-/// KWin names its screencast video capture node
+/// `KWin` names its screencast video capture node
 /// `kwin-screencast-<desktopFileName>` (see kwin's
 /// `screencastmanager.cpp`/`screencaststream.cpp`), where
 /// `<desktopFileName>` is the shared window's desktop-file id (e.g.
 /// `org.mozilla.firefox`, `steam`, `code`). This is emitted by the
-/// compositor itself and is visible as a plain PipeWire node regardless of
+/// compositor itself and is visible as a plain `PipeWire` node regardless of
 /// what opaque source id Chromium/Electron's `getDisplayMedia()` picker
 /// flow hands back to the page -- see `DesktopMediaID::IdType::
 /// kNativePickerSession` in Chromium, which documents that id as opaque
@@ -60,7 +65,7 @@ pub struct RouteFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreencastHint {
-	/// The raw desktop-file id KWin embedded in the node name, e.g.
+	/// The raw desktop-file id `KWin` embedded in the node name, e.g.
 	/// `org.mozilla.firefox` or `steam`.
 	pub desktop_file_id: String,
 	/// A lowercased, reverse-DNS-stripped fragment of `desktop_file_id`
@@ -72,7 +77,7 @@ pub struct ScreencastHint {
 
 const KWIN_SCREENCAST_NODE_PREFIX: &str = "kwin-screencast-";
 
-/// Scans a live node snapshot for a KWin window-screencast video node and
+/// Scans a live node snapshot for a `KWin` window-screencast video node and
 /// derives a [`ScreencastHint`] from it, if one is currently active.
 /// Shared by both the legacy (`pw-dump`) and native (`libpipewire`)
 /// backends, since both produce the same [`NodeRecord`] shape.
@@ -87,11 +92,7 @@ pub fn find_screencast_hint(nodes: &HashMap<u32, NodeRecord>) -> Option<Screenca
 		// Reverse-DNS ids (org.mozilla.firefox) carry their most specific,
 		// most human-recognizable component last; plain ids (steam, code)
 		// have only one component and are used as-is.
-		let hint = desktop_file_id
-			.rsplit('.')
-			.next()
-			.unwrap_or(desktop_file_id)
-			.to_ascii_lowercase();
+		let hint = desktop_file_id.rsplit('.').next().unwrap_or(desktop_file_id).to_ascii_lowercase();
 
 		if hint.is_empty() {
 			return None;

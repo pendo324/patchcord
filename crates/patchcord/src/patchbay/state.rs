@@ -98,6 +98,11 @@ impl PatchbayState {
 		Ok(nodes)
 	}
 
+	// Doesn't use `self` (collects a fresh global snapshot each call), but
+	// keeps the same `&self` signature as `state_native.rs`'s sibling impl
+	// (which does need `self.backend`), since both are dispatched through
+	// the same `BackendState` enum match in mod.rs.
+	#[allow(clippy::unused_self)]
 	pub fn find_screencast_hint(&self) -> Result<Option<ScreencastHint>> {
 		ensure_pipewire()?;
 		let snapshot = PipeWireSnapshot::collect()?;
@@ -139,15 +144,13 @@ impl PatchbayState {
 
 			self.module_id = Some(module_id);
 
-			let ready_info;
 			let deadline = Instant::now() + Duration::from_secs(3);
 
 			loop {
 				match self.virtual_sink_info() {
 					Ok(Some(info)) => {
 						logger::info(&format!("[patchbay] virtual sink ready: {} ({})", info.sink_name, info.node_id));
-						ready_info = Some(info);
-						break;
+						break info;
 					}
 					Ok(None) => {}
 					Err(err) => {
@@ -161,8 +164,6 @@ impl PatchbayState {
 
 				thread::sleep(Duration::from_millis(200));
 			}
-
-			ready_info.unwrap()
 		};
 
 		if self.remap_module_id.is_none()
@@ -492,10 +493,10 @@ fn to_shareable_node(node: &NodeRecord) -> ShareableNode {
 fn clean_orphaned_modules(prefix: &str) {
 	if let Ok(output) = run_text("pactl", &["list", "short", "modules"]) {
 		for line in output.lines() {
-			if line.contains(prefix) {
-				if let Some(id_str) = line.split_whitespace().next() {
-					let _ = run_text("pactl", &["unload-module", id_str]);
-				}
+			if line.contains(prefix)
+				&& let Some(id_str) = line.split_whitespace().next()
+			{
+				let _ = run_text("pactl", &["unload-module", id_str]);
 			}
 		}
 	}

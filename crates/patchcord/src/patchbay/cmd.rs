@@ -77,11 +77,11 @@ mod tests {
 	#[test]
 	fn test_integration_run_command_failure() {
 		// Attempt to run a command that definitely doesn't exist
-		let err = run_text("this-command-does-not-exist-12345", &[]).unwrap_err();
+		let err = run_text("this-command-does-not-exist-12345", &[]).expect_err("running a nonexistent command should fail");
 
 		match err {
 			BackendError::Io(cmd, _) => assert_eq!(cmd, "this-command-does-not-exist-12345"),
-			_ => panic!("Expected IO error for missing executable, got: {:?}", err),
+			_ => panic!("Expected IO error for missing executable, got: {err:?}"),
 		}
 	}
 }

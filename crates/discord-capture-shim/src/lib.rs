@@ -94,40 +94,37 @@ use std::sync::{Mutex, OnceLock};
 // ---------------------------------------------------------------------
 
 type PaStreamSetMonitorStreamFn = unsafe extern "C" fn(*mut c_void, u32) -> c_int;
-type PaStreamConnectRecordFn =
-    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void, c_int) -> c_int;
+type PaStreamConnectRecordFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_void, c_int) -> c_int;
 
 static REAL_PA_STREAM_SET_MONITOR_STREAM: OnceLock<usize> = OnceLock::new();
 static REAL_PA_STREAM_CONNECT_RECORD: OnceLock<usize> = OnceLock::new();
 
 fn real_pa_symbol(name: &CStr, version: &CStr) -> *mut c_void {
-    // SAFETY: RTLD_NEXT + valid NUL-terminated C strings is the
-    // documented way to reach the "real" implementation of a
-    // specifically-versioned symbol from an interposing shared object.
-    let ptr = unsafe { libc::dlvsym(libc::RTLD_NEXT, name.as_ptr(), version.as_ptr()) };
-    assert!(
-        !ptr.is_null(),
-        "discord-capture-shim: failed to resolve real {name:?} via dlvsym(RTLD_NEXT, ..., \"PULSE_0\")"
-    );
-    ptr
+	// SAFETY: RTLD_NEXT + valid NUL-terminated C strings is the
+	// documented way to reach the "real" implementation of a
+	// specifically-versioned symbol from an interposing shared object.
+	let ptr = unsafe { libc::dlvsym(libc::RTLD_NEXT, name.as_ptr(), version.as_ptr()) };
+	assert!(
+		!ptr.is_null(),
+		"discord-capture-shim: failed to resolve real {name:?} via dlvsym(RTLD_NEXT, ..., \"PULSE_0\")"
+	);
+	ptr
 }
 
 fn real_pa_stream_set_monitor_stream() -> PaStreamSetMonitorStreamFn {
-    let addr = *REAL_PA_STREAM_SET_MONITOR_STREAM
-        .get_or_init(|| real_pa_symbol(c"pa_stream_set_monitor_stream", c"PULSE_0") as usize);
-    // SAFETY: addr was produced by a successful dlvsym call resolving
-    // the real pa_stream_set_monitor_stream, so it matches that
-    // function's documented signature.
-    unsafe { std::mem::transmute::<usize, PaStreamSetMonitorStreamFn>(addr) }
+	let addr = *REAL_PA_STREAM_SET_MONITOR_STREAM.get_or_init(|| real_pa_symbol(c"pa_stream_set_monitor_stream", c"PULSE_0") as usize);
+	// SAFETY: addr was produced by a successful dlvsym call resolving
+	// the real pa_stream_set_monitor_stream, so it matches that
+	// function's documented signature.
+	unsafe { std::mem::transmute::<usize, PaStreamSetMonitorStreamFn>(addr) }
 }
 
 fn real_pa_stream_connect_record() -> PaStreamConnectRecordFn {
-    let addr = *REAL_PA_STREAM_CONNECT_RECORD
-        .get_or_init(|| real_pa_symbol(c"pa_stream_connect_record", c"PULSE_0") as usize);
-    // SAFETY: addr was produced by a successful dlvsym call resolving
-    // the real pa_stream_connect_record, so it matches that function's
-    // documented signature.
-    unsafe { std::mem::transmute::<usize, PaStreamConnectRecordFn>(addr) }
+	let addr = *REAL_PA_STREAM_CONNECT_RECORD.get_or_init(|| real_pa_symbol(c"pa_stream_connect_record", c"PULSE_0") as usize);
+	// SAFETY: addr was produced by a successful dlvsym call resolving
+	// the real pa_stream_connect_record, so it matches that function's
+	// documented signature.
+	unsafe { std::mem::transmute::<usize, PaStreamConnectRecordFn>(addr) }
 }
 
 // ---------------------------------------------------------------------
@@ -139,15 +136,15 @@ fn real_pa_stream_connect_record() -> PaStreamConnectRecordFn {
 /// never changes for the lifetime of the process, so caching avoids a
 /// syscall on every single interposed call.
 fn allowlist_parent_pid() -> u32 {
-    static PPID: AtomicU32 = AtomicU32::new(0);
-    let cached = PPID.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-    // SAFETY: getppid() takes no arguments and cannot fail.
-    let ppid = unsafe { libc::getppid() }.cast_unsigned();
-    PPID.store(ppid, Ordering::Relaxed);
-    ppid
+	static PPID: AtomicU32 = AtomicU32::new(0);
+	let cached = PPID.load(Ordering::Relaxed);
+	if cached != 0 {
+		return cached;
+	}
+	// SAFETY: getppid() takes no arguments and cannot fail.
+	let ppid = unsafe { libc::getppid() }.cast_unsigned();
+	PPID.store(ppid, Ordering::Relaxed);
+	ppid
 }
 
 /// `$XDG_RUNTIME_DIR`, falling back to the POSIX-conventional
@@ -157,20 +154,20 @@ fn allowlist_parent_pid() -> u32 {
 /// itself is virtually always set for a real desktop session -- this
 /// fallback only matters in the rare case it genuinely isn't).
 fn runtime_dir() -> String {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !dir.is_empty()
-    {
-        return dir;
-    }
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    format!("/run/user/{uid}")
+	if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+		&& !dir.is_empty()
+	{
+		return dir;
+	}
+	// SAFETY: getuid() takes no arguments and cannot fail.
+	let uid = unsafe { libc::getuid() };
+	format!("/run/user/{uid}")
 }
 
 fn allowlist_path() -> std::path::PathBuf {
-    std::path::Path::new(&runtime_dir())
-        .join("patchcord")
-        .join(format!("discord-capture-allowed.{}", allowlist_parent_pid()))
+	std::path::Path::new(&runtime_dir())
+		.join("patchcord")
+		.join(format!("discord-capture-allowed.{}", allowlist_parent_pid()))
 }
 
 /// Reads the allow-list file fresh on every call (deliberately not
@@ -181,19 +178,19 @@ fn allowlist_path() -> std::path::PathBuf {
 /// need for this shim to be told about changes via any additional
 /// mechanism.
 fn is_allowed(sink_input_idx: u32) -> bool {
-    let path = allowlist_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        log(&format!(
-            "allow-list file {} not readable; treating sink_input_idx={sink_input_idx} as not allowed",
-            path.display()
-        ));
-        return false;
-    };
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .any(|line| line.parse::<u32>() == Ok(sink_input_idx))
+	let path = allowlist_path();
+	let Ok(contents) = std::fs::read_to_string(&path) else {
+		log(&format!(
+			"allow-list file {} not readable; treating sink_input_idx={sink_input_idx} as not allowed",
+			path.display()
+		));
+		return false;
+	};
+	contents
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty())
+		.any(|line| line.parse::<u32>() == Ok(sink_input_idx))
 }
 
 // ---------------------------------------------------------------------
@@ -227,8 +224,8 @@ fn is_allowed(sink_input_idx: u32) -> bool {
 const NULL_SINK_MONITOR_SOURCE: &CStr = c"discord-capture-null.monitor";
 
 fn blocked_streams() -> &'static Mutex<HashSet<usize>> {
-    static BLOCKED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    BLOCKED.get_or_init(|| Mutex::new(HashSet::new()))
+	static BLOCKED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+	BLOCKED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 // ---------------------------------------------------------------------
@@ -254,34 +251,31 @@ fn blocked_streams() -> &'static Mutex<HashSet<usize>> {
 /// Same preconditions as the real `pa_stream_set_monitor_stream`: `stream`
 /// must be a valid, non-connected `pa_stream*`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pa_stream_set_monitor_stream(
-    stream: *mut c_void,
-    sink_input_idx: u32,
-) -> c_int {
-    if is_allowed(sink_input_idx) {
-        log(&format!(
-            "pa_stream_set_monitor_stream: sink_input_idx={sink_input_idx} allowed, forwarding"
-        ));
-        // A stream pointer can be reused by the allocator after an
-        // earlier stream on the same address was destroyed; clear any
-        // stale "blocked" marking for this address before allowing it
-        // through, so a previously-blocked-then-freed stream's address
-        // being reused for a now-allowed stream can never accidentally
-        // redirect it to the null sink.
-        if let Ok(mut blocked) = blocked_streams().lock() {
-            blocked.remove(&(stream as usize));
-        }
-        // SAFETY: forwarding the caller's own arguments, unmodified, to
-        // the real pa_stream_set_monitor_stream.
-        return unsafe { real_pa_stream_set_monitor_stream()(stream, sink_input_idx) };
-    }
-    log(&format!(
-        "pa_stream_set_monitor_stream: sink_input_idx={sink_input_idx} NOT allowed, suppressing call and marking stream for null-sink redirect"
-    ));
-    if let Ok(mut blocked) = blocked_streams().lock() {
-        blocked.insert(stream as usize);
-    }
-    0
+pub unsafe extern "C" fn pa_stream_set_monitor_stream(stream: *mut c_void, sink_input_idx: u32) -> c_int {
+	if is_allowed(sink_input_idx) {
+		log(&format!(
+			"pa_stream_set_monitor_stream: sink_input_idx={sink_input_idx} allowed, forwarding"
+		));
+		// A stream pointer can be reused by the allocator after an
+		// earlier stream on the same address was destroyed; clear any
+		// stale "blocked" marking for this address before allowing it
+		// through, so a previously-blocked-then-freed stream's address
+		// being reused for a now-allowed stream can never accidentally
+		// redirect it to the null sink.
+		if let Ok(mut blocked) = blocked_streams().lock() {
+			blocked.remove(&(stream as usize));
+		}
+		// SAFETY: forwarding the caller's own arguments, unmodified, to
+		// the real pa_stream_set_monitor_stream.
+		return unsafe { real_pa_stream_set_monitor_stream()(stream, sink_input_idx) };
+	}
+	log(&format!(
+		"pa_stream_set_monitor_stream: sink_input_idx={sink_input_idx} NOT allowed, suppressing call and marking stream for null-sink redirect"
+	));
+	if let Ok(mut blocked) = blocked_streams().lock() {
+		blocked.insert(stream as usize);
+	}
+	0
 }
 
 /// Interposed `pa_stream_connect_record(stream, dev, attr, flags)`.
@@ -306,40 +300,31 @@ pub unsafe extern "C" fn pa_stream_set_monitor_stream(
 /// `dev` (if non-null) must be a valid NUL-terminated C string for the
 /// duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pa_stream_connect_record(
-    stream: *mut c_void,
-    dev: *const c_char,
-    attr: *const c_void,
-    flags: c_int,
-) -> c_int {
-    let is_blocked = blocked_streams()
-        .lock()
-        .is_ok_and(|blocked| blocked.contains(&(stream as usize)));
+pub unsafe extern "C" fn pa_stream_connect_record(stream: *mut c_void, dev: *const c_char, attr: *const c_void, flags: c_int) -> c_int {
+	let is_blocked = blocked_streams().lock().is_ok_and(|blocked| blocked.contains(&(stream as usize)));
 
-    if is_blocked {
-        log("pa_stream_connect_record: stream previously blocked, redirecting dev to discord_capture_null.monitor");
-        // SAFETY: forwarding stream/attr/flags unmodified, and
-        // NULL_SINK_MONITOR_SOURCE is a valid `'static` NUL-terminated C
-        // string literal, sound to pass in place of the caller's own
-        // `dev` argument.
-        return unsafe {
-            real_pa_stream_connect_record()(stream, NULL_SINK_MONITOR_SOURCE.as_ptr(), attr, flags)
-        };
-    }
+	if is_blocked {
+		log("pa_stream_connect_record: stream previously blocked, redirecting dev to discord_capture_null.monitor");
+		// SAFETY: forwarding stream/attr/flags unmodified, and
+		// NULL_SINK_MONITOR_SOURCE is a valid `'static` NUL-terminated C
+		// string literal, sound to pass in place of the caller's own
+		// `dev` argument.
+		return unsafe { real_pa_stream_connect_record()(stream, NULL_SINK_MONITOR_SOURCE.as_ptr(), attr, flags) };
+	}
 
-    // SAFETY: forwarding the caller's own arguments, completely
-    // unmodified, to the real pa_stream_connect_record.
-    unsafe { real_pa_stream_connect_record()(stream, dev, attr, flags) }
+	// SAFETY: forwarding the caller's own arguments, completely
+	// unmodified, to the real pa_stream_connect_record.
+	unsafe { real_pa_stream_connect_record()(stream, dev, attr, flags) }
 }
 
 fn log(msg: &str) {
-    // Deliberately plain eprintln rather than a logging crate: this is a
-    // tiny, dependency-minimal shim injected into another process's
-    // address space, and stderr is already redirected/captured by
-    // Discord's own process supervision (or the terminal it was launched
-    // from) -- no separate log file/config needed for something this
-    // small.
-    eprintln!("[discord-capture-shim] {msg}");
+	// Deliberately plain eprintln rather than a logging crate: this is a
+	// tiny, dependency-minimal shim injected into another process's
+	// address space, and stderr is already redirected/captured by
+	// Discord's own process supervision (or the terminal it was launched
+	// from) -- no separate log file/config needed for something this
+	// small.
+	eprintln!("[discord-capture-shim] {msg}");
 }
 
 /// Sanity marker export.
@@ -349,8 +334,8 @@ fn log(msg: &str) {
 /// a real interposed call first.
 #[unsafe(no_mangle)]
 pub extern "C" fn discord_capture_shim_version() -> *const c_char {
-    static VERSION: OnceLock<CString> = OnceLock::new();
-    VERSION
-        .get_or_init(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_default())
-        .as_ptr()
+	static VERSION: OnceLock<CString> = OnceLock::new();
+	VERSION
+		.get_or_init(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_default())
+		.as_ptr()
 }
