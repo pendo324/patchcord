@@ -191,4 +191,25 @@ impl NodeRecord {
 
 		has_device_id || is_audio_device
 	}
+
+	/// True for Discord's own per-app "Stream With Audio" screenshare
+	/// capture node. Matches the exact same three-property identity used
+	/// by `discord-capture-shim` (the separate `LD_PRELOAD` interposer
+	/// that strips `target.object`/`node.autoconnect` from this node
+	/// before Discord's own `pw_stream_new` call creates it -- see that
+	/// crate's own doc comment for the full background). Checking all
+	/// three properties (not just `node.name`) keeps this from matching
+	/// any unrelated stream that happens to reuse the `discord_capture`
+	/// name elsewhere.
+	///
+	/// Live-verified (this session): Discord creates one of these per
+	/// audio-producing app it detects, each individually linked to that
+	/// app's output via `target.object` -- confirmed by disconnecting one
+	/// app's link and observing that app go silent for a live viewer
+	/// instantly, then restoring it by reconnecting.
+	pub fn is_discord_capture(&self) -> bool {
+		self.matches_prop("node.name", "discord_capture")
+			&& self.matches_prop("media.name", "game capture")
+			&& self.matches_prop("application.process.binary", "Discord")
+	}
 }

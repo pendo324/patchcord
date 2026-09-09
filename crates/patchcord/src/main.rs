@@ -69,6 +69,28 @@ enum Request {
 	#[serde(rename = "restoreDefaultSink")]
 	RestoreDefaultSink { id: u64 },
 
+	#[serde(rename = "setDiscordCaptureTargets")]
+	SetDiscordCaptureTargets {
+		id: u64,
+		#[serde(rename = "nodeIds")]
+		node_ids: Vec<u32>,
+
+		#[serde(default, rename = "onlySpeakers")]
+		only_speakers: bool,
+
+		#[serde(default, rename = "onlyDefaultSpeakers")]
+		only_default_speakers: bool,
+
+		#[serde(default, rename = "ignoreDevices")]
+		ignore_devices: bool,
+
+		#[serde(default, rename = "ignoreVirtual")]
+		ignore_virtual: bool,
+
+		#[serde(default, rename = "ignoreInputMedia")]
+		ignore_input_media: bool,
+	},
+
 	#[serde(rename = "dispose")]
 	Dispose { id: u64 },
 }
@@ -168,6 +190,24 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 		}
 		Request::RestoreDefaultSink { id } => {
 			write_result(out, id, patchbay.restore_default_sink())?;
+		}
+		Request::SetDiscordCaptureTargets {
+			id,
+			node_ids,
+			only_speakers,
+			only_default_speakers,
+			ignore_devices,
+			ignore_virtual,
+			ignore_input_media,
+		} => {
+			let filter = patchbay::RouteFilter {
+				only_speakers,
+				only_default_speakers,
+				ignore_devices,
+				ignore_virtual,
+				ignore_input_media,
+			};
+			write_result(out, id, patchbay.set_discord_capture_targets(node_ids, filter))?;
 		}
 		Request::Dispose { id } => {
 			write_result(out, id, patchbay.dispose())?;
@@ -355,6 +395,18 @@ fn main() -> io::Result<()> {
 				}
 			}
 			IncomingMessage::GraphChanged => {
+				// Reconcile discord_capture links against the current
+				// selection before forwarding the event to the client:
+				// this is what makes a freshly-created discord_capture
+				// node (a newly-launched app, or the user's selected app
+				// restarting) get linked immediately, rather than only
+				// on the client's own debounced re-poll. No-op (and
+				// cheap) when nothing is currently selected or nothing
+				// actually changed -- see sync_discord_capture_links's
+				// own doc comment.
+				if let Err(err) = patchbay.sync_discord_capture_links() {
+					logger::warn(&format!("[helper] discord_capture link sync failed: {err}"));
+				}
 				write_json_line(&mut stdout, &EventMessage { event: "graphChanged" })?;
 			}
 			IncomingMessage::MonitorDied => {
