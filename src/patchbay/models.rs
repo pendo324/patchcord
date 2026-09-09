@@ -13,7 +13,25 @@ pub struct ShareableNode {
 	pub media_name: Option<String>,
 	pub binary: Option<String>,
 	pub process_id: Option<u32>,
+	pub media_class: Option<String>,
+	pub is_virtual: bool,
 	pub is_device: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RouteFilter {
+	/// When sharing many nodes at once, only keep nodes whose current
+	/// output actually reaches a device (speaker) on the graph.
+	pub only_speakers: bool,
+	/// Like only_speakers, but must reach the *default* sink specifically.
+	pub only_default_speakers: bool,
+	/// Exclude device nodes (mic/speaker) from being routed.
+	pub ignore_devices: bool,
+	/// Exclude virtual nodes (node.virtual=true).
+	pub ignore_virtual: bool,
+	/// Exclude capture-oriented nodes (media.class Stream/Input/Audio).
+	pub ignore_input_media: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

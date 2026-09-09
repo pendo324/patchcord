@@ -37,6 +37,21 @@ enum Request {
 		id: u64,
 		#[serde(rename = "nodeIds")]
 		node_ids: Vec<u32>,
+
+		#[serde(default, rename = "onlySpeakers")]
+		only_speakers: bool,
+
+		#[serde(default, rename = "onlyDefaultSpeakers")]
+		only_default_speakers: bool,
+
+		#[serde(default, rename = "ignoreDevices")]
+		ignore_devices: bool,
+
+		#[serde(default, rename = "ignoreVirtual")]
+		ignore_virtual: bool,
+
+		#[serde(default, rename = "ignoreInputMedia")]
+		ignore_input_media: bool,
 	},
 
 	#[serde(rename = "clearRoutes")]
@@ -109,8 +124,23 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 		Request::EnsureVirtualSink { id } => {
 			write_result(out, id, patchbay.ensure_virtual_sink())?;
 		}
-		Request::RouteNodes { id, node_ids } => {
-			write_result(out, id, patchbay.route_nodes(node_ids))?;
+		Request::RouteNodes {
+			id,
+			node_ids,
+			only_speakers,
+			only_default_speakers,
+			ignore_devices,
+			ignore_virtual,
+			ignore_input_media,
+		} => {
+			let filter = patchbay::RouteFilter {
+				only_speakers,
+				only_default_speakers,
+				ignore_devices,
+				ignore_virtual,
+				ignore_input_media,
+			};
+			write_result(out, id, patchbay.route_nodes(node_ids, filter))?;
 		}
 		Request::ClearRoutes { id } => {
 			write_result(out, id, patchbay.clear_routes())?;

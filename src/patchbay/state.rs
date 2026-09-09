@@ -477,6 +477,8 @@ fn to_shareable_node(node: &NodeRecord) -> ShareableNode {
 		media_name,
 		binary,
 		process_id,
+		media_class: node.prop_str("media.class").map(str::to_string),
+		is_virtual: node.prop_str("node.virtual") == Some("true"),
 		is_device: node.is_device(),
 	}
 }

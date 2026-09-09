@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
-use super::models::{NodeRecord, ShareableNode, VirtualSinkInfo};
+use super::models::{NodeRecord, RouteFilter, ShareableNode, VirtualSinkInfo};
 use super::pw_backend::{BackendEvent, GraphSnapshot, PipewireBackend};
 use super::routing::map_ports;
 use super::PatchbayConfig;
@@ -251,7 +251,7 @@ impl PatchbayStateNative {
         }
     }
 
-    pub fn route_nodes(&mut self, node_ids: Vec<u32>) -> Result<VirtualSinkInfo> {
+    pub fn route_nodes(&mut self, node_ids: Vec<u32>, filter: RouteFilter) -> Result<VirtualSinkInfo> {
         if node_ids.is_empty() {
             self.clear_routes()?;
             return self.ensure_virtual_sink();
@@ -273,6 +273,11 @@ impl PatchbayStateNative {
             return Err(BackendError::Message("virtual sink has no usable stereo input ports".to_string()));
         }
 
+        let default_sink_id = filter
+            .only_default_speakers
+            .then(|| resolve_default_sink_id(&snapshot))
+            .flatten();
+
         let mut new_handles = Vec::<u32>::new();
         let mut failed = Vec::<u32>::new();
 
@@ -289,6 +294,14 @@ impl PatchbayStateNative {
 
             if self.is_our_virtual_audio_object(node) {
                 logger::warn(&format!("[patchbay] refusing to route helper-owned virtual node {node_id}"));
+                continue;
+            }
+
+            if !should_link(&snapshot, node, &filter, default_sink_id) {
+                logger::debug(&format!(
+                    "[patchbay] node {node_id} filtered out by route filter (only_speakers={}, only_default={}, ignore_devices={}, ignore_virtual={}, ignore_input_media={})",
+                    filter.only_speakers, filter.only_default_speakers, filter.ignore_devices, filter.ignore_virtual, filter.ignore_input_media
+                ));
                 continue;
             }
 
@@ -469,6 +482,67 @@ fn to_shareable_node(node: &NodeRecord) -> ShareableNode {
         media_name,
         binary,
         process_id,
+        media_class: node.prop_str("media.class").map(str::to_string),
+        is_virtual: node.prop_str("node.virtual") == Some("true"),
         is_device: node.is_device(),
     }
+}
+/// Resolves the registry id of the default sink from the live metadata
+/// (`default.audio.sink` -> node.name match), if known.
+fn resolve_default_sink_id(snapshot: &GraphSnapshot) -> Option<u32> {
+    let name = snapshot.default_sink_name.as_ref()?;
+    snapshot
+        .nodes
+        .values()
+        .find(|n| n.prop_str("node.name") == Some(name.as_str()))
+        .map(|n| n.id)
+}
+
+/// Mirrors venmic's `should_link()` decision for a candidate node:
+/// whether it should be routed to the virtual sink given the active route
+/// filter. `only_speakers`/`only_default_speakers` inspect where the
+/// node's audio is *currently* connected on the graph, exactly like
+/// venmic, rather than filtering on static node type alone.
+fn should_link(
+    snapshot: &GraphSnapshot,
+    node: &NodeRecord,
+    filter: &RouteFilter,
+    default_sink_id: Option<u32>,
+) -> bool {
+    if node.is_device() && filter.ignore_devices {
+        return false;
+    }
+    if node.prop_str("node.virtual") == Some("true") && filter.ignore_virtual {
+        return false;
+    }
+    if matches!(node.prop_str("media.class"), Some(c) if c.starts_with("Stream/Input/Audio"))
+        && filter.ignore_input_media
+    {
+        return false;
+    }
+
+    if filter.only_speakers || filter.only_default_speakers {
+        // Which nodes does this node's output currently terminate at?
+        let targets = snapshot.link_targets_of(node.id);
+
+        let reaches_device = targets.iter().any(|target_id| {
+            snapshot
+                .nodes
+                .get(target_id)
+                .is_some_and(|t| t.prop_str("device.id").is_some_and(|v| !v.is_empty()))
+        });
+
+        if filter.only_speakers && !reaches_device {
+            return false;
+        }
+
+        if filter.only_default_speakers {
+            match default_sink_id {
+                Some(sink_id) if targets.contains(&sink_id) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    true
 }
