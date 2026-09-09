@@ -58,133 +58,126 @@ const SHIM_SONAME: &str = "discord-capture-shim.so";
 const BACKUP_SUFFIX: &str = ".discord-capture-setup.orig";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+	let args: Vec<String> = env::args().collect();
 
-    if args.len() == 3 && args[1] == "--restore" {
-        return match restore(&args[2]) {
-            Ok(true) => {
-                println!("discord-capture-setup: restored {} from backup", args[2]);
-                ExitCode::SUCCESS
-            }
-            Ok(false) => {
-                println!("discord-capture-setup: no backup found for {}, nothing to restore", args[2]);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("discord-capture-setup: failed to restore {}: {e}", args[2]);
-                ExitCode::FAILURE
-            }
-        };
-    }
+	if args.len() == 3 && args[1] == "--restore" {
+		return match restore(&args[2]) {
+			Ok(true) => {
+				println!("discord-capture-setup: restored {} from backup", args[2]);
+				ExitCode::SUCCESS
+			}
+			Ok(false) => {
+				println!("discord-capture-setup: no backup found for {}, nothing to restore", args[2]);
+				ExitCode::SUCCESS
+			}
+			Err(e) => {
+				eprintln!("discord-capture-setup: failed to restore {}: {e}", args[2]);
+				ExitCode::FAILURE
+			}
+		};
+	}
 
-    let [_, target_path, shim_dir] = args.as_slice() else {
-        eprintln!(
-            "usage: discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>\n       discord-capture-setup --restore <path-to-`discord_voice.node`>"
-        );
-        return ExitCode::FAILURE;
-    };
+	let [_, target_path, shim_dir] = args.as_slice() else {
+		eprintln!(
+			"usage: discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>\n       discord-capture-setup --restore <path-to-`discord_voice.node`>"
+		);
+		return ExitCode::FAILURE;
+	};
 
-    match run(target_path, shim_dir) {
-        Ok(Outcome::Patched) => {
-            println!("discord-capture-setup: patched {target_path} (backup saved as {target_path}{BACKUP_SUFFIX})");
-            ExitCode::SUCCESS
-        }
-        Ok(Outcome::AlreadyPatched) => {
-            println!("discord-capture-setup: {target_path} already patched, nothing to do");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("discord-capture-setup: failed to patch {target_path}: {e}");
-            ExitCode::FAILURE
-        }
-    }
+	match run(target_path, shim_dir) {
+		Ok(Outcome::Patched) => {
+			println!("discord-capture-setup: patched {target_path} (backup saved as {target_path}{BACKUP_SUFFIX})");
+			ExitCode::SUCCESS
+		}
+		Ok(Outcome::AlreadyPatched) => {
+			println!("discord-capture-setup: {target_path} already patched, nothing to do");
+			ExitCode::SUCCESS
+		}
+		Err(e) => {
+			eprintln!("discord-capture-setup: failed to patch {target_path}: {e}");
+			ExitCode::FAILURE
+		}
+	}
 }
 
 enum Outcome {
-    Patched,
-    AlreadyPatched,
+	Patched,
+	AlreadyPatched,
 }
 
 /// Restores `target_path` from its `BACKUP_SUFFIX` sidecar, if one
 /// exists. Returns `Ok(false)` (not an error) when no backup exists --
 /// e.g. `--restore` run on a file that was never patched.
 fn restore(target_path: &str) -> Result<bool, String> {
-    let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
-    if !std::path::Path::new(&backup_path).exists() {
-        return Ok(false);
-    }
+	let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
+	if !std::path::Path::new(&backup_path).exists() {
+		return Ok(false);
+	}
 
-    let tmp_path = format!("{target_path}.discord-capture-setup.restoretmp");
-    fs::copy(&backup_path, &tmp_path).map_err(|e| format!("copy backup to temp: {e}"))?;
+	let tmp_path = format!("{target_path}.discord-capture-setup.restoretmp");
+	fs::copy(&backup_path, &tmp_path).map_err(|e| format!("copy backup to temp: {e}"))?;
 
-    if let Ok(meta) = fs::metadata(target_path) {
-        let _ = fs::set_permissions(&tmp_path, meta.permissions());
-    }
+	if let Ok(meta) = fs::metadata(target_path) {
+		let _ = fs::set_permissions(&tmp_path, meta.permissions());
+	}
 
-    fs::rename(&tmp_path, target_path).map_err(|e| format!("rename into place: {e}"))?;
-    Ok(true)
+	fs::rename(&tmp_path, target_path).map_err(|e| format!("rename into place: {e}"))?;
+	Ok(true)
 }
 
 fn run(target_path: &str, shim_dir: &str) -> Result<Outcome, String> {
-    let original = fs::read(target_path).map_err(|e| format!("read: {e}"))?;
+	let original = fs::read(target_path).map_err(|e| format!("read: {e}"))?;
 
-    let mut container =
-        ElfContainer::parse(&original).map_err(|e| format!("parse ELF: {e}"))?;
+	let mut container = ElfContainer::parse(&original).map_err(|e| format!("parse ELF: {e}"))?;
 
-    let already_needed = container
-        .inner
-        .elf_needed()
-        .any(|n| n == SHIM_SONAME.as_bytes());
+	let already_needed = container.inner.elf_needed().any(|n| n == SHIM_SONAME.as_bytes());
 
-    if already_needed {
-        return Ok(Outcome::AlreadyPatched);
-    }
+	if already_needed {
+		return Ok(Outcome::AlreadyPatched);
+	}
 
-    // Save a backup of the genuinely-untouched original before making
-    // any change -- only reached when we've just confirmed the file is
-    // NOT already patched, so this can never save an already-patched
-    // copy as the "original". Written before the ELF is modified at all
-    // (not after), so a failure partway through add_needed/set_runpath
-    // below still leaves a valid backup in place.
-    let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
-    if !std::path::Path::new(&backup_path).exists() {
-        fs::write(&backup_path, &original).map_err(|e| format!("write backup: {e}"))?;
-    }
+	// Save a backup of the genuinely-untouched original before making
+	// any change -- only reached when we've just confirmed the file is
+	// NOT already patched, so this can never save an already-patched
+	// copy as the "original". Written before the ELF is modified at all
+	// (not after), so a failure partway through add_needed/set_runpath
+	// below still leaves a valid backup in place.
+	let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
+	if !std::path::Path::new(&backup_path).exists() {
+		fs::write(&backup_path, &original).map_err(|e| format!("write backup: {e}"))?;
+	}
 
-    container
-        .add_needed(vec![SHIM_SONAME.to_string()])
-        .map_err(|e| format!("add DT_NEEDED: {e}"))?;
+	container
+		.add_needed(vec![SHIM_SONAME.to_string()])
+		.map_err(|e| format!("add DT_NEEDED: {e}"))?;
 
-    // Preserve the existing RUNPATH (e.g. "$ORIGIN") rather than
-    // clobbering it -- discord_voice.node's own other DT_NEEDED entries
-    // (libmediapipe.so etc.) still need to resolve via $ORIGIN.
-    let mut runpath_entries = container.get_rpath();
-    let shim_dir_owned = shim_dir.to_string();
-    if !runpath_entries.iter().any(|p| p == &shim_dir_owned) {
-        runpath_entries.push(shim_dir_owned);
-    }
-    let new_runpath = runpath_entries.join(":");
-    container
-        .set_runpath(new_runpath)
-        .map_err(|e| format!("set RUNPATH: {e}"))?;
+	// Preserve the existing RUNPATH (e.g. "$ORIGIN") rather than
+	// clobbering it -- discord_voice.node's own other DT_NEEDED entries
+	// (libmediapipe.so etc.) still need to resolve via $ORIGIN.
+	let mut runpath_entries = container.get_rpath();
+	let shim_dir_owned = shim_dir.to_string();
+	if !runpath_entries.iter().any(|p| p == &shim_dir_owned) {
+		runpath_entries.push(shim_dir_owned);
+	}
+	let new_runpath = runpath_entries.join(":");
+	container.set_runpath(new_runpath).map_err(|e| format!("set RUNPATH: {e}"))?;
 
-    // Write to a temp file in the same directory then rename over the
-    // original atomically, so a crash/failure mid-write never leaves
-    // discord_voice.node truncated or corrupt (that would break Discord
-    // voice entirely, not just this feature).
-    let tmp_path = format!("{target_path}.discord-capture-setup.tmp");
-    container
-        .write_to_path(std::path::Path::new(&tmp_path))
-        .map_err(|e| format!("write patched file: {e}"))?;
+	// Write to a temp file in the same directory then rename over the
+	// original atomically, so a crash/failure mid-write never leaves
+	// discord_voice.node truncated or corrupt (that would break Discord
+	// voice entirely, not just this feature).
+	let tmp_path = format!("{target_path}.discord-capture-setup.tmp");
+	container
+		.write_to_path(std::path::Path::new(&tmp_path))
+		.map_err(|e| format!("write patched file: {e}"))?;
 
-    // Preserve the original file's permissions (patchelf-equivalent tools
-    // can otherwise leave the output non-executable).
-    if let Ok(meta) = fs::metadata(target_path) {
-        let _ = fs::set_permissions(&tmp_path, meta.permissions());
-    }
+	// Preserve the original file's permissions (patchelf-equivalent tools
+	// can otherwise leave the output non-executable).
+	if let Ok(meta) = fs::metadata(target_path) {
+		let _ = fs::set_permissions(&tmp_path, meta.permissions());
+	}
 
-    fs::rename(&tmp_path, target_path).map_err(|e| format!("rename into place: {e}"))?;
+	fs::rename(&tmp_path, target_path).map_err(|e| format!("rename into place: {e}"))?;
 
-    Ok(Outcome::Patched)
+	Ok(Outcome::Patched)
 }
-

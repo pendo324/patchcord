@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  resolve-image:
+    # Resolves the concrete digest ghcr.io/.../patchcord-builder:latest
+    # currently points at, once, so every matrix leg in `build` pulls the
+    # exact same image by digest (recorded in dist/provenance-*.txt too)
+    # instead of each independently re-resolving the floating :latest
+    # tag, which could drift if a new image is published mid-run.
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - id: digest
+        run: |
+          image="ghcr.io/${{ github.repository_owner }}/patchcord-builder:latest"
+          digest=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-image
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            asset_arch: x64
+            rust_target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            asset_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/patchcord-builder@${{ needs.resolve-image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: ./scripts/build-release.sh ${{ matrix.arch }}
+        env:
+          PATCHCORD_ASSET_ARCH: ${{ matrix.asset_arch }}
+          PATCHCORD_RUST_TARGET: ${{ matrix.rust_target }}
+          PATCHCORD_BUILDER_IMAGE: ghcr.io/${{ github.repository_owner }}/patchcord-builder@${{ needs.resolve-image.outputs.digest }}
+          PATCHCORD_BUILDER_IMAGE_DIGEST: ${{ needs.resolve-image.outputs.digest }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*
+            !dist/*.build-id
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build combined provenance summary
+        run: |
+          {
+            echo "<details>"
+            echo "<summary>Build provenance</summary>"
+            echo
+            echo '```'
+            cat dist/provenance-*.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > provenance-summary.md
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          append_body: true
+          body_path: provenance-summary.md

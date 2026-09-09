@@ -177,7 +177,7 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 				ignore_virtual,
 				ignore_input_media,
 			};
-			write_result(out, id, patchbay.route_nodes(node_ids, filter))?;
+			write_result(out, id, patchbay.route_nodes(node_ids, &filter))?;
 		}
 		Request::ClearRoutes { id } => {
 			write_result(out, id, patchbay.clear_routes())?;
@@ -287,22 +287,21 @@ fn spawn_stdin_thread(tx: mpsc::Sender<IncomingMessage>) {
 /// Forwards graph-change events from the native backend into the main
 /// protocol loop as `graphChanged` messages, replacing the `pw-mon`
 /// subprocess used by the legacy backend.
-fn spawn_native_event_thread_concrete(
-	events: mpsc::Receiver<patchbay::pw_backend::BackendEvent>,
-	tx: mpsc::Sender<IncomingMessage>,
-) {
-	thread::spawn(move || loop {
-		match events.recv() {
-			Ok(patchbay::pw_backend::BackendEvent::GraphChanged) => {
-				if tx.send(IncomingMessage::GraphChanged).is_err() {
-					return;
+fn spawn_native_event_thread_concrete(events: mpsc::Receiver<patchbay::pw_backend::BackendEvent>, tx: mpsc::Sender<IncomingMessage>) {
+	thread::spawn(move || {
+		loop {
+			match events.recv() {
+				Ok(patchbay::pw_backend::BackendEvent::GraphChanged) => {
+					if tx.send(IncomingMessage::GraphChanged).is_err() {
+						return;
+					}
 				}
+				Ok(patchbay::pw_backend::BackendEvent::DefaultSinkChanged(_)) => {
+					// Not currently surfaced in the protocol output; reserved
+					// for the only-default-speakers filter work.
+				}
+				Err(_) => return,
 			}
-			Ok(patchbay::pw_backend::BackendEvent::DefaultSinkChanged(_)) => {
-				// Not currently surfaced in the protocol output; reserved
-				// for the only-default-speakers filter work.
-			}
-			Err(_) => return,
 		}
 	});
 }
@@ -321,18 +320,18 @@ fn spawn_pw_mon_thread(tx: mpsc::Sender<IncomingMessage>) -> Option<Child> {
 
 	thread::spawn(move || {
 		let reader = io::BufReader::new(stdout);
-		let mut last_trigger = Instant::now() - Duration::from_secs(1);
+		let mut last_trigger = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
 
 		for line in reader.lines() {
 			let Ok(text) = line else { break };
 
-			if text.contains("PipeWire:Interface:Node") || text.contains("PipeWire:Interface:Port") {
-				if last_trigger.elapsed() > Duration::from_millis(400) {
-					if tx.send(IncomingMessage::GraphChanged).is_err() {
-						return;
-					}
-					last_trigger = Instant::now();
+			if (text.contains("PipeWire:Interface:Node") || text.contains("PipeWire:Interface:Port"))
+				&& last_trigger.elapsed() > Duration::from_millis(400)
+			{
+				if tx.send(IncomingMessage::GraphChanged).is_err() {
+					return;
 				}
+				last_trigger = Instant::now();
 			}
 		}
 		let _ = tx.send(IncomingMessage::MonitorDied);
@@ -343,7 +342,8 @@ fn spawn_pw_mon_thread(tx: mpsc::Sender<IncomingMessage>) -> Option<Child> {
 
 fn main() -> io::Result<()> {
 	if std::env::args().any(|a| a == "--pw-backend-spike") {
-		return run_pw_backend_spike();
+		run_pw_backend_spike();
+		return Ok(());
 	}
 
 	let legacy_backend = std::env::args().any(|a| a == "--legacy-backend");
@@ -360,7 +360,7 @@ fn main() -> io::Result<()> {
 	// channel (registry global/global_remove listeners); the legacy
 	// backend uses an external `pw-mon` subprocess instead.
 	let monitor_child = if let Some(native_events) = patchbay.take_native_events() {
-		spawn_native_event_thread_concrete(native_events, tx.clone());
+		spawn_native_event_thread_concrete(native_events, tx);
 		None
 	} else {
 		spawn_pw_mon_thread(tx)
@@ -430,11 +430,18 @@ fn main() -> io::Result<()> {
 }
 
 /// Exercises the native `pw_backend` module end-to-end against a live
-/// PipeWire server: connect, snapshot the graph, create a virtual sink,
+/// `PipeWire` server: connect, snapshot the graph, create a virtual sink,
 /// snapshot again to see it appear, route a real node to it, then tear
 /// everything down. Not part of the real protocol; a manual validation
 /// aid for the pipewire-rs backend rewrite.
-fn run_pw_backend_spike() -> io::Result<()> {
+// Deliberately one long linear sequence of manual test steps (connect,
+// create, snapshot, link, destroy, snapshot again, ...) rather than split
+// into helper functions -- splitting a step-by-step manual smoke test like
+// this tends to obscure the actual sequence being exercised more than it
+// helps, and this is debug/diagnostic-only code, never part of the real
+// protocol path.
+#[allow(clippy::too_many_lines)]
+fn run_pw_backend_spike() {
 	use patchbay::pw_backend::{BackendEvent, PipewireBackend};
 	use std::sync::mpsc;
 	use std::time::Duration;
@@ -449,7 +456,12 @@ fn run_pw_backend_spike() -> io::Result<()> {
 	while event_rx.try_recv().is_ok() {}
 
 	let snapshot = backend.snapshot().expect("snapshot failed");
-	println!("Initial snapshot: {} nodes, {} links, default_sink={:?}", snapshot.nodes.len(), snapshot.links.len(), snapshot.default_sink_name);
+	println!(
+		"Initial snapshot: {} nodes, {} links, default_sink={:?}",
+		snapshot.nodes.len(),
+		snapshot.links.len(),
+		snapshot.default_sink_name
+	);
 	let with_ports = snapshot.nodes.values().filter(|n| n.output_ports().next().is_some()).count();
 	let app_like = snapshot
 		.nodes
@@ -470,7 +482,7 @@ fn run_pw_backend_spike() -> io::Result<()> {
 		);
 	}
 
-	assert!(snapshot.nodes.len() > 0, "expected at least one node in the live graph");
+	assert!(!snapshot.nodes.is_empty(), "expected at least one node in the live graph");
 
 	println!("Creating a virtual sink via the native backend...");
 	let sink_name = format!("pw-backend-spike-sink-{}", std::process::id());
@@ -484,7 +496,7 @@ fn run_pw_backend_spike() -> io::Result<()> {
 	let mut saw_graph_changed = false;
 	let deadline = std::time::Instant::now() + Duration::from_secs(2);
 	while std::time::Instant::now() < deadline {
-		if let Ok(BackendEvent::GraphChanged) = event_rx.recv_timeout(Duration::from_millis(100)) {
+		if matches!(event_rx.recv_timeout(Duration::from_millis(100)), Ok(BackendEvent::GraphChanged)) {
 			saw_graph_changed = true;
 			break;
 		}
@@ -492,7 +504,11 @@ fn run_pw_backend_spike() -> io::Result<()> {
 	println!("Observed GraphChanged event: {saw_graph_changed}");
 
 	let snapshot2 = backend.snapshot().expect("snapshot failed");
-	println!("  post-create snapshot: {} nodes, {} links", snapshot2.nodes.len(), snapshot2.links.len());
+	println!(
+		"  post-create snapshot: {} nodes, {} links",
+		snapshot2.nodes.len(),
+		snapshot2.links.len()
+	);
 	let interesting: Vec<String> = snapshot2
 		.nodes
 		.values()
@@ -505,15 +521,12 @@ fn run_pw_backend_spike() -> io::Result<()> {
 		.values()
 		.find(|n| n.prop_str("node.name") == Some(sink_name.as_str()))
 		.map(|n| n.id);
-	let sink_id = match found {
-		Some(id) => {
-			println!("SUCCESS: found virtual sink in snapshot, id={id}");
-			id
-		}
-		None => {
-			println!("FAILED: virtual sink not found in post-create snapshot");
-			return Ok(());
-		}
+	let sink_id = if let Some(id) = found {
+		println!("SUCCESS: found virtual sink in snapshot, id={id}");
+		id
+	} else {
+		println!("FAILED: virtual sink not found in post-create snapshot");
+		return;
 	};
 
 	// Exercise SetMute: mute the sink, confirm the prop flips, unmute.
@@ -554,30 +567,23 @@ fn run_pw_backend_spike() -> io::Result<()> {
 		.cloned();
 	let sink = snapshot3.nodes.get(&sink_id).cloned();
 	match (app, sink) {
-		(Some(app), Some(sink)) if !app.output_ports().next().is_none() && !sink.input_ports().next().is_none() => {
+		(Some(app), Some(sink)) if app.output_ports().next().is_some() && sink.input_ports().next().is_some() => {
 			let out_port = app.output_ports().next().expect("app has output port").id;
 			let in_port = sink.input_ports().next().expect("sink has input port").id;
-			println!(
-				"Linking app node {} port {out_port} -> sink {} port {in_port}...",
-				app.id, sink.id
-			);
+			println!("Linking app node {} port {out_port} -> sink {} port {in_port}...", app.id, sink.id);
 			match backend.create_link(app.id, out_port, sink.id, in_port) {
 				Ok(link_id) => {
 					println!("  link created, id={link_id}");
 					thread::sleep(Duration::from_millis(250));
-					let linked = backend.snapshot().ok().is_some_and(|s| {
-						s.links
-							.values()
-							.any(|l| l.output_node == app.id && l.input_node == sink_id)
-					});
+					let linked = backend
+						.snapshot()
+						.is_ok_and(|s| s.links.values().any(|l| l.output_node == app.id && l.input_node == sink_id));
 					println!("  link visible in graph: {linked}");
 					let _ = backend.destroy_link(link_id);
 					thread::sleep(Duration::from_millis(200));
-					let gone = !backend.snapshot().ok().is_some_and(|s| {
-						s.links
-							.values()
-							.any(|l| l.output_node == app.id && l.input_node == sink_id)
-					});
+					let gone = !backend
+						.snapshot()
+						.is_ok_and(|s| s.links.values().any(|l| l.output_node == app.id && l.input_node == sink_id));
 					println!("  link gone after destroy: {gone}");
 				}
 				Err(err) => println!("  create_link failed: {err}"),
@@ -593,16 +599,10 @@ fn run_pw_backend_spike() -> io::Result<()> {
 		Err(err) => println!("destroy_node failed: {err}"),
 	}
 	thread::sleep(Duration::from_millis(150));
-	let still_there = backend
-		.snapshot()
-		.ok()
-		.is_some_and(|s| s.nodes.contains_key(&sink_id));
+	let still_there = backend.snapshot().is_ok_and(|s| s.nodes.contains_key(&sink_id));
 	println!("  sink still present after destroy: {still_there}");
 
 	println!("Spike complete, shutting down backend.");
 	drop(backend);
 	thread::sleep(Duration::from_millis(200));
-
-	Ok(())
 }
-

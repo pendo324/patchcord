@@ -1,7 +1,7 @@
 pub mod cmd;
-pub mod pw_backend;
 pub mod error;
 pub mod models;
+pub mod pw_backend;
 pub mod routing;
 pub mod snapshot;
 pub mod state;
@@ -30,7 +30,7 @@ pub struct PatchbayConfig {
 	pub virtual_mic_description: Option<String>,
 	/// Creates the virtual sink with plain `Audio/Sink` media class instead
 	/// of `Audio/Sink/Virtual`. Required for `set_default_sink_to_virtual`
-	/// to actually work: WirePlumber's default-node policy
+	/// to actually work: `WirePlumber`'s default-node policy
 	/// (default-nodes/rescan.lua) only ever considers `Audio/Sink` and
 	/// `Audio/Duplex` nodes as sink-default candidates, so an
 	/// `Audio/Sink/Virtual` node can be *written* into
@@ -179,7 +179,7 @@ impl AudioSharePatchbay {
 	/// The receiver for async graph events emitted by the native backend,
 	/// if it is in use. main.rs maps these to `graphChanged` protocol
 	/// events, replacing the old `pw-mon` subprocess.
-	pub fn take_native_events(&mut self) -> Option<state_native::BackendEventReceiver> {
+	pub const fn take_native_events(&mut self) -> Option<state_native::BackendEventReceiver> {
 		self.native_events.take()
 	}
 
@@ -193,7 +193,7 @@ impl AudioSharePatchbay {
 	/// Best-effort correlation of an in-progress KDE/KWin window-share with
 	/// a likely audio-producing app; see [`ScreencastHint`]'s doc comment
 	/// for the mechanism and its limits. `None` means "no active window
-	/// share detected" or "not on KWin" -- callers should treat that as
+	/// share detected" or "not on `KWin`" -- callers should treat that as
 	/// the normal case and fall back to the full unfiltered node list.
 	pub fn find_screencast_hint(&self) -> Result<Option<ScreencastHint>> {
 		match &self.state {
@@ -209,7 +209,7 @@ impl AudioSharePatchbay {
 		}
 	}
 
-	pub fn route_nodes(&mut self, node_ids: Vec<u32>, filter: RouteFilter) -> Result<VirtualSinkInfo> {
+	pub fn route_nodes(&mut self, node_ids: Vec<u32>, filter: &RouteFilter) -> Result<VirtualSinkInfo> {
 		match &mut self.state {
 			BackendState::Legacy(state) => state.route_nodes(node_ids),
 			BackendState::Native(state) => state.route_nodes(node_ids, filter),
