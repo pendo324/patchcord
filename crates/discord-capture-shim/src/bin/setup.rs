@@ -19,12 +19,34 @@
 //! entry or erroring, so `native.ts` can call this unconditionally on
 //! every plugin start without tracking whether it already ran.
 //!
-//! Usage: discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>
+//! Usage:
+//!   discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>
+//!   discord-capture-setup --restore <path-to-`discord_voice.node`>
 //!
 //! `<path-to-shim-dir>` is added to RUNPATH (alongside the existing
 //! `$ORIGIN`, not replacing it) so the dynamic linker can actually find
 //! `discord-capture-shim.so` at load time regardless of where Discord's
 //! own modules directory is.
+//!
+//! # Backup / restore
+//!
+//! Before ever modifying `discord_voice.node`, a copy of the original,
+//! untouched file is written alongside it as
+//! `discord_voice.node.discord-capture-setup.orig` -- created once (the
+//! first successful patch only; a second patch run against an
+//! already-patched file is a no-op per the idempotency above, so it
+//! never overwrites a good backup with an already-patched copy). This
+//! makes the whole operation genuinely reversible: `--restore` copies
+//! the backup back over the live file (also via a write-to-temp-then-
+//! rename, for the same crash-safety reason as the normal patch path)
+//! and leaves the backup in place afterward, so `--restore` can be run
+//! more than once safely.
+//!
+//! Without this, a bad shim build, an incompatible future Discord
+//! update, or simply the user wanting to uninstall the plugin would have
+//! no way back to a known-good `discord_voice.node` short of a full
+//! Discord reinstall -- unacceptable for something that unconditionally
+//! patches a binary outside the plugin's own directory on every launch.
 
 use std::env;
 use std::fs;
@@ -33,19 +55,38 @@ use std::process::ExitCode;
 use arwen::elf::ElfContainer;
 
 const SHIM_SONAME: &str = "discord-capture-shim.so";
+const BACKUP_SUFFIX: &str = ".discord-capture-setup.orig";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+
+    if args.len() == 3 && args[1] == "--restore" {
+        return match restore(&args[2]) {
+            Ok(true) => {
+                println!("discord-capture-setup: restored {} from backup", args[2]);
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("discord-capture-setup: no backup found for {}, nothing to restore", args[2]);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("discord-capture-setup: failed to restore {}: {e}", args[2]);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let [_, target_path, shim_dir] = args.as_slice() else {
         eprintln!(
-            "usage: discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>"
+            "usage: discord-capture-setup <path-to-`discord_voice.node`> <path-to-shim-dir>\n       discord-capture-setup --restore <path-to-`discord_voice.node`>"
         );
         return ExitCode::FAILURE;
     };
 
     match run(target_path, shim_dir) {
         Ok(Outcome::Patched) => {
-            println!("discord-capture-setup: patched {target_path}");
+            println!("discord-capture-setup: patched {target_path} (backup saved as {target_path}{BACKUP_SUFFIX})");
             ExitCode::SUCCESS
         }
         Ok(Outcome::AlreadyPatched) => {
@@ -64,6 +105,26 @@ enum Outcome {
     AlreadyPatched,
 }
 
+/// Restores `target_path` from its `BACKUP_SUFFIX` sidecar, if one
+/// exists. Returns `Ok(false)` (not an error) when no backup exists --
+/// e.g. `--restore` run on a file that was never patched.
+fn restore(target_path: &str) -> Result<bool, String> {
+    let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
+    if !std::path::Path::new(&backup_path).exists() {
+        return Ok(false);
+    }
+
+    let tmp_path = format!("{target_path}.discord-capture-setup.restoretmp");
+    fs::copy(&backup_path, &tmp_path).map_err(|e| format!("copy backup to temp: {e}"))?;
+
+    if let Ok(meta) = fs::metadata(target_path) {
+        let _ = fs::set_permissions(&tmp_path, meta.permissions());
+    }
+
+    fs::rename(&tmp_path, target_path).map_err(|e| format!("rename into place: {e}"))?;
+    Ok(true)
+}
+
 fn run(target_path: &str, shim_dir: &str) -> Result<Outcome, String> {
     let original = fs::read(target_path).map_err(|e| format!("read: {e}"))?;
 
@@ -77,6 +138,17 @@ fn run(target_path: &str, shim_dir: &str) -> Result<Outcome, String> {
 
     if already_needed {
         return Ok(Outcome::AlreadyPatched);
+    }
+
+    // Save a backup of the genuinely-untouched original before making
+    // any change -- only reached when we've just confirmed the file is
+    // NOT already patched, so this can never save an already-patched
+    // copy as the "original". Written before the ELF is modified at all
+    // (not after), so a failure partway through add_needed/set_runpath
+    // below still leaves a valid backup in place.
+    let backup_path = format!("{target_path}{BACKUP_SUFFIX}");
+    if !std::path::Path::new(&backup_path).exists() {
+        fs::write(&backup_path, &original).map_err(|e| format!("write backup: {e}"))?;
     }
 
     container
@@ -115,3 +187,4 @@ fn run(target_path: &str, shim_dir: &str) -> Result<Outcome, String> {
 
     Ok(Outcome::Patched)
 }
+
