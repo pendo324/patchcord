@@ -218,12 +218,23 @@ export class AudioSharePatchbay extends EventEmitter {
         return this.#request('ensureVirtualSink');
     }
 
-    async routeNodes(nodeIds) {
-        return this.#request('routeNodes', { nodeIds });
+    async routeNodes(nodeIds, filter = {}) {
+        return this.#request('routeNodes', {
+            nodeIds,
+            onlySpeakers: filter.onlySpeakers ?? false,
+            onlyDefaultSpeakers: filter.onlyDefaultSpeakers ?? false,
+            ignoreDevices: filter.ignoreDevices ?? false,
+            ignoreVirtual: filter.ignoreVirtual ?? false,
+            ignoreInputMedia: filter.ignoreInputMedia ?? false,
+        });
     }
 
     async clearRoutes() {
         await this.#request('clearRoutes');
+    }
+
+    async setVirtualMicMute(mute) {
+        await this.#request('setVirtualMicMute', { mute });
     }
 
     async dispose() {

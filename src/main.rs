@@ -57,6 +57,9 @@ enum Request {
 	#[serde(rename = "clearRoutes")]
 	ClearRoutes { id: u64 },
 
+	#[serde(rename = "setVirtualMicMute")]
+	SetVirtualMicMute { id: u64, mute: bool },
+
 	#[serde(rename = "dispose")]
 	Dispose { id: u64 },
 }
@@ -144,6 +147,9 @@ fn handle_request(out: &mut impl Write, patchbay: &mut AudioSharePatchbay, reque
 		}
 		Request::ClearRoutes { id } => {
 			write_result(out, id, patchbay.clear_routes())?;
+		}
+		Request::SetVirtualMicMute { id, mute } => {
+			write_result(out, id, patchbay.set_virtual_mic_mute(mute))?;
 		}
 		Request::Dispose { id } => {
 			write_result(out, id, patchbay.dispose())?;

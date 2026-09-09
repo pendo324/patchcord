@@ -397,6 +397,17 @@ impl PatchbayStateNative {
         self.find_node_id_by_name(&self.session.sink_name)
     }
 
+    /// Mutes or unmutes the virtual mic node itself (matches venmic's
+    /// "Initial Mute" toggle: mute right after linking to swallow the
+    /// startup audio spike Chromium produces when a new input device
+    /// appears, then unmute once the share is actually live).
+    pub fn set_virtual_mic_mute(&self, mute: bool) -> Result<()> {
+        let Some(mic_id) = self.find_mic_id()? else {
+            return Err(BackendError::Message("virtual mic is not active".to_string()));
+        };
+        self.backend.set_mute(mic_id, mute)
+    }
+
     fn find_mic_id(&self) -> Result<Option<u32>> {
         self.session
             .mic_name
